@@ -27,26 +27,55 @@ static uint64_t monotonicMicros() {
           .count());
 }
 
-int runMediaTekSession(HANDLE stopEvent) {
-  const auto reportPath = statePath(L"session-result.json");
-  const auto releasePath = statePath(L"memory-release.signal");
-  std::unique_ptr<OwlLink> awdlLink;
-  // Replace stale health before memory allocation or hardware access.
-  {
-    std::ofstream health(statePath(L"native-health.json.tmp"), std::ios::trunc);
-    health << "{\"running\":false,\"state\":\"allocating-memory\"}";
-    health.close();
-    MoveFileExW(statePath(L"native-health.json.tmp").c_str(),
-                statePath(L"native-health.json").c_str(),
-                MOVEFILE_REPLACE_EXISTING);
+struct TimerResolution {
+  bool active = timeBeginPeriod(1) == TIMERR_NOERROR;
+  ~TimerResolution() {
+    if (active) timeEndPeriod(1);
+  }
+};
+class MediaTekSession {
+public:
+  explicit MediaTekSession(HANDLE stop) : stopEvent(stop) {}
+  int run() {
+    TimerResolution timer;
+    // Replace stale health before memory allocation or hardware access.
+    {
+      std::ofstream health(statePath(L"native-health.json.tmp"),
+                           std::ios::trunc);
+      health << "{\"running\":false,\"state\":\"allocating-memory\"}";
+      health.close();
+      MoveFileExW(statePath(L"native-health.json.tmp").c_str(),
+                  statePath(L"native-health.json").c_str(),
+                  MOVEFILE_REPLACE_EXISTING);
+    }
+
+    try {
+      initializeDma();
+      if (done) {
+        receiveCapabilities();
+        try {
+          configureRadio();
+          pollFrames();
+        } catch (const std::exception &failure) {
+          error = failure.what();
+        }
+        stopRadio();
+      }
+    } catch (const std::exception &failure) {
+      error = failure.what();
+    }
+    return releaseAndReport();
   }
 
-  struct TimerResolution {
-    bool active = timeBeginPeriod(1) == TIMERR_NOERROR;
-    ~TimerResolution() {
-      if (active) timeEndPeriod(1);
-    }
-  } timerResolution;
+private:
+  const HANDLE stopEvent;
+  const std::filesystem::path reportPath = statePath(L"session-result.json");
+  const std::filesystem::path releasePath = statePath(L"memory-release.signal");
+  std::unique_ptr<OwlLink> awdlLink;
+  std::vector<size_t> low;
+  volatile Descriptor *ring = nullptr, *rxRing = nullptr, *dataRing = nullptr;
+  unsigned tail = 0, dataTail = 0, txSlot = 1, publications = 1;
+  std::deque<std::vector<uint8_t>> mcuFrames;
   HANDLE handle = INVALID_HANDLE_VALUE, token = nullptr;
   // Prefer a 2 MiB nonpaged-large allocation. All OS-returned PFNs are
   // checked before the radio can use the 37 packed 32-bit DMA pages.
@@ -66,15 +95,12 @@ int runMediaTekSession(HANDLE stopEvent) {
        snifferDisabled = false;
   bool clockAttempted = false, clockEnabled = false, clockDisabled = false;
 
-  
   unsigned rawFrames = 0, awdlFrames = 0, invalidFrames = 0, dataPackets = 0;
-  unsigned radioTxSubmitted = 0, probeResponses = 0;
-  unsigned ackFrames = 0;
+
   unsigned fragmentedDescriptors = 0, oversizedDropped = 0;
   unsigned controlDataDrained = 0;
   unsigned mcuForwardedFrames = 0;
-  MtkTxStatus broadcastStatus, unicastStatus, alternateStatus,
-      fwBroadcastStatus, fwUnicastStatus, fwAlternateStatus;
+
   bool deviceEnabled = false, bssEnabled = false, peerEnabled = false;
   bool deviceDisabled = false, bssDisabled = false, peerDisabled = false;
   bool rocAttempted = false, rocCommandAck = false, rocAborted = false;
@@ -108,12 +134,31 @@ int runMediaTekSession(HANDLE stopEvent) {
     uint64_t received = 0;
   };
   std::array<HeardPeer, 16> heardPeers{};
-  auto peerReceived = [&](const std::array<uint8_t, 6> &mac) {
+
+  std::vector<uint8_t> hostCandidate;
+  uint64_t hostCandidateAt = 0;
+  unsigned peerSwitches = 0, hostExpired = 0;
+  std::string error;
+  unsigned char *bufferPointer(unsigned logical) const {
+
+    const auto slice = mtkDmaSlice(logical);
+    return static_cast<unsigned char *>(view) + low.at(slice.page) * 4096 +
+           slice.offset;
+  }
+  unsigned bufferAddress(unsigned logical) const {
+
+    const auto slice = mtkDmaSlice(logical);
+    return static_cast<unsigned>((frames[low.at(slice.page)] << 12) +
+                                 slice.offset);
+  }
+  uint64_t peerReceived(const std::array<uint8_t, 6> &mac) const {
+
     for (const auto &item : heardPeers)
       if (item.address == mac) return item.received;
     return uint64_t(0);
-  };
-  auto hearPeer = [&](const uint8_t *mac) {
+  }
+  void hearPeer(const uint8_t *mac) {
+
     if (mac[0] & 1 || std::equal(radioAddress.begin(), radioAddress.end(), mac))
       return;
     auto item = std::find_if(
@@ -127,12 +172,125 @@ int runMediaTekSession(HANDLE stopEvent) {
                               });
     std::copy(mac, mac + 6, item->address.begin());
     item->received = monotonicMicros();
-  };
-  std::vector<uint8_t> hostCandidate;
-  uint64_t hostCandidateAt = 0;
-  unsigned peerSwitches = 0, hostExpired = 0;
-  std::string error;
-  try {
+  }
+  void drainControlData() {
+
+    if (!dataRing) return;
+    // RX must keep advancing while we await a command reply, too.
+    // Otherwise a full data ring can block the shared RX engine.
+    for (unsigned drained = 0; drained < 32; ++drained) {
+      MemoryBarrier();
+      if (!(dataRing[dataTail].ctrl & 0x80000000u)) break;
+      dataRing[dataTail].info = 0;
+      dataRing[dataTail].ctrl = 2048u << 16;
+      MemoryBarrier();
+      operation(handle, 0x2528, REGPROXY_WRITE, dataTail);
+      dataTail = (dataTail + 1) % 32;
+      ++controlDataDrained;
+    }
+  }
+  bool waitEvent(auto predicate, unsigned waitMilliseconds = 3000) {
+
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(waitMilliseconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+      MemoryBarrier();
+      const auto control = rxRing[tail].ctrl;
+      rxDmaIndex = operation(handle, 0x250c);
+      if (!(control & 0x80000000u)) {
+        // During the live AWDL loop the one-millisecond poll
+        // leaves normal reception to its parser, not this drain.
+        if (waitMilliseconds > 1) drainControlData();
+        Sleep(1);
+        continue;
+      }
+      const unsigned bytes = (control >> 16) & 0x3fff;
+      if (!bytes || bytes > 2048 || !(control & 0x40000000u))
+        throw std::runtime_error("Invalid or fragmented MCU RX descriptor");
+      const auto *data = bufferPointer(3 + tail);
+
+      ++receivedEvents;
+      if (!mtkDot11Frame(data, bytes).empty()) {
+        if (mcuFrames.size() == 32) mcuFrames.pop_front();
+        mcuFrames.emplace_back(data, data + bytes);
+        ++mcuForwardedFrames;
+      }
+      for (unsigned slot = 0; slot < pendingActions.size(); ++slot) {
+        auto &pending = pendingActions[slot];
+        if (!pending.active) continue;
+        const auto status =
+            mtkFwTxStatus(data, bytes, uint8_t(128 + slot), pending.sequence);
+        if (status.matched) {
+          ++awdlTxFirmwareCompleted;
+          if (pending.data) {
+            ++dataTxFirmwareCompleted;
+            if (pending.unicast) {
+              if (status.success) {
+                dataTxAck = true;
+                ++dataUnicastAckCount;
+              } else
+                ++dataUnicastFailedCount;
+            }
+          } else if (pending.unicast && status.success)
+            awdlUnicastAck = true;
+          pending.active = false;
+        }
+      }
+
+      const bool matched = predicate(data, bytes);
+      rxRing[tail].info = 0;
+      rxRing[tail].ctrl = 2048u << 16;
+      MemoryBarrier();
+      operation(handle, 0x2508, REGPROXY_WRITE, tail);
+      tail = (tail + 1) % 32;
+      if (matched) return true;
+    }
+    return false;
+  }
+  void send(const std::vector<uint8_t> &packet, unsigned bufferIndex = 1) {
+
+    if (publications >= 100000000u || packet.size() > 2048)
+      throw std::runtime_error("MCU publication limit exceeded");
+    MemoryBarrier();
+    if (!(ring[(txSlot + 255) % 256].ctrl & 0x80000000u) ||
+        operation(handle, 0x23fc) != txSlot)
+      throw std::runtime_error(
+          "The shared MCU command buffer is still owned by DMA");
+    auto *buffer = bufferPointer(bufferIndex);
+    ZeroMemory(buffer, 2048);
+    CopyMemory(buffer, packet.data(), packet.size());
+    ring[txSlot].buf0 = bufferAddress(bufferIndex);
+    ring[txSlot].info = 0;
+    ring[txSlot].ctrl =
+        0x40000000u | (static_cast<unsigned>(packet.size()) << 16);
+    const auto next = (txSlot + 1) % 256;
+    MemoryBarrier();
+    operation(handle, 0x23f8, REGPROXY_WRITE, next);
+    ++publications;
+    const auto deadline = GetTickCount64() + 1000;
+    while (GetTickCount64() < deadline) {
+      MemoryBarrier();
+      if ((ring[txSlot].ctrl & 0x80000000u) &&
+          operation(handle, 0x23fc) == next) {
+        if (!next) ++ringWraps;
+        txSlot = next;
+        return;
+      }
+      Sleep(1);
+    }
+    throw std::runtime_error("Subsequent MCU DMA completion was not observed");
+  }
+  bool commandReply(uint8_t sequence, uint8_t cid) {
+
+    MtkCommandResult result;
+    waitEvent([&](const uint8_t *data, size_t bytes) {
+      const auto reply = mtkCommandResult(data, bytes, sequence, cid);
+      if (reply.matched) result = reply;
+      return reply.matched;
+    });
+    return result.matched && result.status == 0;
+  }
+  void initializeDma() {
     SYSTEM_INFO system{};
     GetSystemInfo(&system);
     if (system.dwPageSize != 4096)
@@ -158,7 +316,7 @@ int runMediaTekSession(HANDLE stopEvent) {
     allocationFlags = allocation.flags;
     allocationAttempts = allocation.attempts;
     frames = std::move(allocation.frames);
-    auto low = std::move(allocation.low);
+    low = std::move(allocation.low);
     count = frames.size();
     lowPagesAvailable = static_cast<unsigned>(low.size());
     view = VirtualAlloc(nullptr, count * 4096, MEM_RESERVE | MEM_PHYSICAL,
@@ -167,17 +325,8 @@ int runMediaTekSession(HANDLE stopEvent) {
       throw std::runtime_error("Physical mapping failed");
     mapped = true;
     ZeroMemory(view, count * 4096);
-    auto bufferPointer = [&](unsigned logical) {
-      const auto slice = mtkDmaSlice(logical);
-      return static_cast<unsigned char *>(view) + low.at(slice.page) * 4096 +
-             slice.offset;
-    };
-    auto bufferAddress = [&](unsigned logical) {
-      const auto slice = mtkDmaSlice(logical);
-      return static_cast<unsigned>((frames[low.at(slice.page)] << 12) +
-                                   slice.offset);
-    };
-    auto *ring = reinterpret_cast<volatile Descriptor *>(bufferPointer(0));
+
+    ring = reinterpret_cast<volatile Descriptor *>(bufferPointer(0));
     auto *command = bufferPointer(1);
     ZeroMemory(command, 2048);
     for (unsigned index = 0; index < 256; ++index) {
@@ -191,8 +340,6 @@ int runMediaTekSession(HANDLE stopEvent) {
     ringAddress = bufferAddress(0);
     ring[0].buf0 = bufferAddress(1);
     ring[0].ctrl = 0x40380000; // LAST_SEC0 | (56 << 16), DDONE initially clear.
-    volatile Descriptor *rxRing = nullptr;
-    volatile Descriptor *dataRing = nullptr;
 
     rxRing = reinterpret_cast<volatile Descriptor *>(bufferPointer(2));
     for (unsigned index = 0; index < 32; ++index) {
@@ -283,586 +430,441 @@ int runMediaTekSession(HANDLE stopEvent) {
       Sleep(1);
     }
     if (!done) error = "MCU DMA completion was not observed";
-    if (done) {
+  }
+  void receiveCapabilities() {
+    if (!waitEvent([&](const uint8_t *data, size_t bytes) {
+          const auto parsed = mtkParseNicCapability(data, bytes, 1);
+          if (parsed.matched) capability = parsed;
+          return capability.valid;
+        }))
+      throw std::runtime_error(
+          "A complete matching NIC capability reply was not observed");
 
-      unsigned tail = 0;
-      unsigned dataTail = 0;
-      std::deque<std::vector<uint8_t>> mcuFrames;
-      auto drainControlData = [&] {
-        if (!dataRing) return;
-        // RX must keep advancing while we await a command reply, too.
-        // Otherwise a full data ring can block the shared RX engine.
-        for (unsigned drained = 0; drained < 32; ++drained) {
-          MemoryBarrier();
-          if (!(dataRing[dataTail].ctrl & 0x80000000u)) break;
-          dataRing[dataTail].info = 0;
-          dataRing[dataTail].ctrl = 2048u << 16;
-          MemoryBarrier();
-          operation(handle, 0x2528, REGPROXY_WRITE, dataTail);
-          dataTail = (dataTail + 1) % 32;
-          ++controlDataDrained;
+    radioAddress = capability.address;
+  }
+  void configureRadio() {
+    clockAttempted = true;
+    send(mtkClockRequest(true, 15));
+    clockEnabled = commandReply(15, 0x0f);
+    if (!clockEnabled)
+      throw std::runtime_error("Band-gap clock request was not acknowledged");
+
+    send(mtkRadioRequest(true, 2));
+    radioEnabled = commandReply(2, 8);
+    if (!radioEnabled)
+      throw std::runtime_error("Radio-enable command was not acknowledged");
+    send(mtkSnifferRequest(true, 3));
+    snifferEnabled = commandReply(3, 0x24);
+    if (!snifferEnabled)
+      throw std::runtime_error("Sniffer-enable command was not acknowledged");
+
+    if (!capability.addressValid)
+      throw std::runtime_error(
+          "A valid hardware MAC capability is required for the ACK test");
+
+    awdlLink = std::make_unique<OwlLink>(stopEvent);
+    awdlLink->start();
+    radioAddress = awdlLink->address();
+
+    send(mtkDeviceRequest(true, 6, radioAddress));
+    deviceEnabled = commandReply(6, 1);
+    if (!deviceEnabled)
+      throw std::runtime_error("Own MAC activation was not acknowledged");
+    send(mtkBssRequest(true, 7, mtkAwDlBssid));
+    bssEnabled = commandReply(7, 2);
+    if (!bssEnabled)
+      throw std::runtime_error("Own BSS activation was not acknowledged");
+
+    const unsigned requestedTenure = 86400000u;
+    rocAttempted = true;
+    send(mtkRocRequest(true, 13, requestedTenure));
+    if (!waitEvent([&](const uint8_t *data, size_t length) {
+          if (mtkCommandSucceeded(data, length, 13, 0x27)) rocCommandAck = true;
+          const auto grant = mtkRocGrant(data, length, requestedTenure);
+          if (grant.matched) rocGrant = grant;
+          return rocCommandAck && rocGrant.valid;
+        }))
+      throw std::runtime_error("AWDL channel 6 privilege was not granted");
+    continuousRoc = rocGrant.duration >= 86400000u;
+    if (!continuousRoc)
+      throw std::runtime_error(
+          "The required continuous channel privilege was not granted");
+  }
+  void pollFrames() {
+    std::vector<uint8_t> assembly;
+    bool dropping = false;
+    const auto captureStart = GetTickCount64();
+
+    auto nextHealth = captureStart;
+    const auto deadline = captureStart + 82800000ull;
+    while (GetTickCount64() < deadline) {
+      if (GetTickCount64() >= nextHealth) {
+        std::ofstream health(statePath(L"native-health.json.tmp"),
+                             std::ios::trunc);
+        health << "{\"running\":true,\"rocDuration\":" << rocGrant.duration
+               << ",\"transmitted\":" << awdlTxSubmitted
+               << ",\"ringWraps\":" << ringWraps
+               << ",\"dataAck\":" << dataUnicastAckCount
+               << ",\"peerSwitches\":" << peerSwitches
+               << ",\"otherPeerDropped\":" << hostOtherPeerDropped << "}";
+        health.close();
+        MoveFileExW(statePath(L"native-health.json.tmp").c_str(),
+                    statePath(L"native-health.json").c_str(),
+                    MOVEFILE_REPLACE_EXISTING);
+        nextHealth = GetTickCount64() + 2000;
+      }
+
+      if (WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) break;
+      if (awdlLink->stopping())
+        throw std::runtime_error("The AWDL pipe ended early");
+      waitEvent([](const uint8_t *, size_t) { return false; }, 1);
+
+      if (!hostCandidate.empty() &&
+          monotonicMicros() - hostCandidateAt > 2000000) {
+        hostCandidate.clear();
+        ++hostExpired;
+      }
+      if (hostCandidate.empty() && awdlLink->popData(hostCandidate))
+        hostCandidateAt = monotonicMicros();
+      if (!hostCandidate.empty() && !(hostCandidate[4] & 1)) {
+        std::array<uint8_t, 6> target{};
+        std::copy(hostCandidate.begin() + 4, hostCandidate.begin() + 10,
+                  target.begin());
+        const auto heard = peerReceived(target);
+        if (target != awdlPeer && heard && monotonicMicros() - heard <= 4000 &&
+            std::none_of(
+                pendingActions.begin(), pendingActions.end(),
+                [](const PendingAction &item) { return item.active; })) {
+          if (peerEnabled) {
+            send(mtkPeerRequest(false, 9, awdlPeer));
+            if (!commandReply(9, 3))
+              throw std::runtime_error(
+                  "Previous peer record could not be retired");
+            peerEnabled = false;
+          }
+          send(mtkPeerRequest(true, 8, target));
+          if (!commandReply(8, 3))
+            throw std::runtime_error(
+                "Requested host peer record was not acknowledged");
+          peerEnabled = true;
+          awdlPeer = target;
+          awdlPeerLearned = true;
+          peerLastRxUs = peerReceived(target);
+          lastUnicastPeerRxUs = 0;
+          unicastInWindow = 0;
+          ++peerSwitches;
         }
-      };
-      auto waitEvent = [&](auto predicate, unsigned waitMilliseconds = 3000) {
-        const auto deadline = std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds(waitMilliseconds);
-        while (std::chrono::steady_clock::now() < deadline) {
-          MemoryBarrier();
-          const auto control = rxRing[tail].ctrl;
-          rxDmaIndex = operation(handle, 0x250c);
-          if (!(control & 0x80000000u)) {
-            // During the live AWDL loop the one-millisecond poll
-            // leaves normal reception to its parser, not this drain.
-            if (waitMilliseconds > 1) drainControlData();
-            Sleep(1);
-            continue;
-          }
-          const unsigned bytes = (control >> 16) & 0x3fff;
-          if (!bytes || bytes > 2048 || !(control & 0x40000000u))
-            throw std::runtime_error("Invalid or fragmented MCU RX descriptor");
-          const auto *data = bufferPointer(3 + tail);
+      }
 
-          ++receivedEvents;
-          if (!mtkDot11Frame(data, bytes).empty()) {
-            if (mcuFrames.size() == 32) mcuFrames.pop_front();
-            mcuFrames.emplace_back(data, data + bytes);
-            ++mcuForwardedFrames;
-          }
-          const auto broadcast = mtkTxStatus(data, bytes, 128),
-                     unicast = mtkTxStatus(data, bytes, 129);
-          if (broadcast.matched) broadcastStatus = broadcast;
-          if (unicast.matched) unicastStatus = unicast;
-          const auto alternate = mtkTxStatus(data, bytes, 130);
-          if (alternate.matched) alternateStatus = alternate;
-          const auto fwBroadcast = mtkFwTxStatus(data, bytes, 128, 1),
-                     fwUnicast = mtkFwTxStatus(data, bytes, 129, 2),
-                     fwAlternate = mtkFwTxStatus(data, bytes, 130, 3);
-          if (fwBroadcast.matched) fwBroadcastStatus = fwBroadcast;
-          if (fwUnicast.matched) fwUnicastStatus = fwUnicast;
-          if (fwAlternate.matched) fwAlternateStatus = fwAlternate;
+      for (unsigned slot = 0;
+           slot < pendingActions.size() && awdlTxSubmitted < 100000000u;
+           ++slot) {
+        if (pendingActions[slot].active) continue;
+        const auto nowUs = monotonicMicros();
+        const bool peerWindow =
+            peerEnabled &&
+            (peerLastRxUs > lastUnicastPeerRxUs || unicastInWindow < 3) &&
+            nowUs - peerLastRxUs <= 4000;
 
-          for (unsigned slot = 0; slot < pendingActions.size(); ++slot) {
-            auto &pending = pendingActions[slot];
-            if (!pending.active) continue;
-            const auto status = mtkFwTxStatus(data, bytes, uint8_t(128 + slot),
-                                              pending.sequence);
-            if (status.matched) {
-              ++awdlTxFirmwareCompleted;
-              if (pending.data) {
-                ++dataTxFirmwareCompleted;
-                if (pending.unicast) {
-                  if (status.success) {
-                    dataTxAck = true;
-                    ++dataUnicastAckCount;
-                  } else
-                    ++dataUnicastFailedCount;
-                }
-              } else if (pending.unicast && status.success)
-                awdlUnicastAck = true;
-              pending.active = false;
-            }
-          }
+        std::vector<uint8_t> frame;
+        bool hostData = false;
 
-          const bool matched = predicate(data, bytes);
-          rxRing[tail].info = 0;
-          rxRing[tail].ctrl = 2048u << 16;
-          MemoryBarrier();
-          operation(handle, 0x2508, REGPROXY_WRITE, tail);
-          tail = (tail + 1) % 32;
-          if (matched) return true;
+        if (peerWindow && !hostCandidate.empty() &&
+            ((hostCandidate[4] & 1) ||
+             std::equal(awdlPeer.begin(), awdlPeer.end(),
+                        hostCandidate.begin() + 4))) {
+          frame = std::move(hostCandidate);
+          hostCandidate.clear();
+          hostData = true;
         }
-        return false;
-      };
-      if (!waitEvent([&](const uint8_t *data, size_t bytes) {
-            const auto parsed = mtkParseNicCapability(data, bytes, 1);
-            if (parsed.matched) capability = parsed;
-            return capability.valid;
-          }))
-        throw std::runtime_error(
-            "A complete matching NIC capability reply was not observed");
 
-      radioAddress = capability.address;
-      unsigned txSlot = 1;
-      unsigned publications = 1;
-      auto send = [&](const std::vector<uint8_t> &packet,
-                      unsigned bufferIndex = 1) {
-        if (publications >= 100000000u || packet.size() > 2048)
-          throw std::runtime_error("MCU publication limit exceeded");
-        MemoryBarrier();
-        if (!(ring[(txSlot + 255) % 256].ctrl & 0x80000000u) ||
-            operation(handle, 0x23fc) != txSlot)
-          throw std::runtime_error(
-              "The shared MCU command buffer is still owned by DMA");
-        auto *buffer = bufferPointer(bufferIndex);
-        ZeroMemory(buffer, 2048);
-        CopyMemory(buffer, packet.data(), packet.size());
-        ring[txSlot].buf0 = bufferAddress(bufferIndex);
-        ring[txSlot].info = 0;
-        ring[txSlot].ctrl =
-            0x40000000u | (static_cast<unsigned>(packet.size()) << 16);
-        const auto next = (txSlot + 1) % 256;
-        MemoryBarrier();
-        operation(handle, 0x23f8, REGPROXY_WRITE, next);
-        ++publications;
-        const auto deadline = GetTickCount64() + 1000;
-        while (GetTickCount64() < deadline) {
-          MemoryBarrier();
-          if ((ring[txSlot].ctrl & 0x80000000u) &&
-              operation(handle, 0x23fc) == next) {
-            if (!next) ++ringWraps;
-            txSlot = next;
-            return;
+        if (hostData && !(frame[4] & 1) &&
+            !std::equal(awdlPeer.begin(), awdlPeer.end(), frame.begin() + 4)) {
+          ++hostOtherPeerDropped;
+          continue;
+        }
+        const bool managementTrial =
+            peerWindow && !hostData && peerLastRxUs > lastUnicastPeerRxUs &&
+            nowUs - lastManagementTrialUs >= 200000 &&
+            awdlUnicastSubmitted < 100000000u && !awdlUnicastAck;
+        const bool unicast = (hostData && !(frame[4] & 1)) || managementTrial;
+
+        if (!hostData && !awdlLink->pop(frame)) break;
+        const auto sequence = uint16_t((awdlTxSubmitted + 1) & 4095);
+        const auto packet =
+            hostData ? mtkAwDlHostRequest(std::move(frame), sequence,
+                                          uint8_t(128 + slot))
+                     : mtkAwDlActionRequest(std::move(frame), sequence,
+                                            uint8_t(128 + slot),
+                                            unicast ? &awdlPeer : nullptr);
+        pendingActions[slot] = {true, unicast, sequence, hostData};
+        if (hostData) ++dataTxSubmitted;
+        if (unicast) {
+          if (!hostData) {
+            awdlUnicastAttempted = true;
+            ++awdlUnicastSubmitted;
+            lastManagementTrialUs = nowUs;
           }
+          if (peerLastRxUs != lastUnicastPeerRxUs) unicastInWindow = 0;
+          lastUnicastPeerRxUs = peerLastRxUs;
+          ++unicastInWindow;
+          maxUnicastDequeueDelayUs =
+              (std::max)(maxUnicastDequeueDelayUs, nowUs - peerLastRxUs);
+        }
+        send(packet, 68 + slot);
+        ++awdlTxSubmitted;
+      }
+
+      std::vector<uint8_t> record;
+      if (!mcuFrames.empty()) {
+        record = std::move(mcuFrames.front());
+        mcuFrames.pop_front();
+      } else {
+        MemoryBarrier();
+        const auto control = dataRing[dataTail].ctrl;
+        if (!(control & 0x80000000u)) {
           Sleep(1);
+          continue;
         }
-        throw std::runtime_error(
-            "Subsequent MCU DMA completion was not observed");
-      };
-      auto commandReply = [&](uint8_t sequence, uint8_t cid) {
-        MtkCommandResult result;
-        waitEvent([&](const uint8_t *data, size_t bytes) {
-          const auto reply = mtkCommandResult(data, bytes, sequence, cid);
-          if (reply.matched) result = reply;
-          return reply.matched;
-        });
-        return result.matched && result.status == 0;
-      };
-      try {
+        const unsigned bytes = (control >> 16) & 0x3fff;
+        MemoryBarrier();
+        const auto *data = bufferPointer(36 + dataTail);
+        if (!bytes || bytes > 2048 || assembly.size() + bytes > 16384) {
+          if (!dropping) ++oversizedDropped;
+          dropping = true;
+          assembly.clear();
+        } else if (!dropping)
+          assembly.insert(assembly.end(), data, data + bytes);
+        const bool last = (control & 0x40000000u) != 0;
+        if (!last) ++fragmentedDescriptors;
+        dataRing[dataTail].info = 0;
+        dataRing[dataTail].ctrl = 2048u << 16;
+        MemoryBarrier();
+        operation(handle, 0x2528, REGPROXY_WRITE, dataTail);
+        dataTail = (dataTail + 1) % 32;
+        if (!last) continue;
+        if (dropping) {
+          assembly.clear();
+          dropping = false;
+          continue;
+        }
+        record = std::move(assembly);
+        assembly.clear();
+      }
+      ++dataPackets;
 
-        clockAttempted = true;
-        send(mtkClockRequest(true, 15));
-        clockEnabled = commandReply(15, 0x0f);
-        if (!clockEnabled)
-          throw std::runtime_error(
-              "Band-gap clock request was not acknowledged");
+      const auto frame = mtkDot11Frame(record.data(), record.size());
+      if (frame.empty())
+        ++invalidFrames;
+      else {
+        ++rawFrames;
+        if (frame.size() >= 29 &&
+            std::equal(mtkAwDlBssid.begin(), mtkAwDlBssid.end(),
+                       frame.begin() + 16) &&
+            (((mtkLe16(frame.data()) & 0x0c) == 8) ||
+             (frame[0] == 0xd0 && frame[24] == 0x7f && frame[25] == 0 &&
+              frame[26] == 0x17 && frame[27] == 0xf2 && frame[28] == 8)))
+          hearPeer(frame.data() + 10);
+        // Addressed AWDL data proves the peer is awake on
+        // our actual channel. Reply within that fresh window
+        // rather than waiting for a later action frame.
+        if (peerEnabled && frame.size() >= 24 &&
+            (mtkLe16(frame.data()) & 0x0c) == 8 &&
+            std::equal(radioAddress.begin(), radioAddress.end(),
+                       frame.begin() + 4) &&
+            std::equal(awdlPeer.begin(), awdlPeer.end(), frame.begin() + 10) &&
+            std::equal(mtkAwDlBssid.begin(), mtkAwDlBssid.end(),
+                       frame.begin() + 16)) {
+          peerLastRxUs = monotonicMicros();
+          ++peerDataWindows;
+        }
 
-        send(mtkRadioRequest(true, 2));
-        radioEnabled = commandReply(2, 8);
-        if (!radioEnabled)
-          throw std::runtime_error("Radio-enable command was not acknowledged");
-        send(mtkSnifferRequest(true, 3));
-        snifferEnabled = commandReply(3, 0x24);
-        if (!snifferEnabled)
-          throw std::runtime_error(
-              "Sniffer-enable command was not acknowledged");
-
-        if (!capability.addressValid)
-          throw std::runtime_error(
-              "A valid hardware MAC capability is required for the ACK test");
-
-        awdlLink = std::make_unique<OwlLink>(stopEvent);
-        awdlLink->start();
-        radioAddress = awdlLink->address();
-
-        send(mtkDeviceRequest(true, 6, radioAddress));
-        deviceEnabled = commandReply(6, 1);
-        if (!deviceEnabled)
-          throw std::runtime_error("Own MAC activation was not acknowledged");
-        send(mtkBssRequest(true, 7, mtkAwDlBssid));
-        bssEnabled = commandReply(7, 2);
-        if (!bssEnabled)
-          throw std::runtime_error("Own BSS activation was not acknowledged");
-
-        const unsigned requestedTenure = 86400000u;
-        rocAttempted = true;
-        send(mtkRocRequest(true, 13, requestedTenure));
-        if (!waitEvent([&](const uint8_t *data, size_t length) {
-              if (mtkCommandSucceeded(data, length, 13, 0x27))
-                rocCommandAck = true;
-              const auto grant = mtkRocGrant(data, length, requestedTenure);
-              if (grant.matched) rocGrant = grant;
-              return rocCommandAck && rocGrant.valid;
-            }))
-          throw std::runtime_error("AWDL channel 6 privilege was not granted");
-        continuousRoc = rocGrant.duration >= 86400000u;
-        if (!continuousRoc)
-          throw std::runtime_error(
-              "The required continuous channel privilege was not granted");
-
-        std::vector<uint8_t> assembly;
-        bool dropping = false;
-        const auto captureStart = GetTickCount64();
-
-        auto nextHealth = captureStart;
-        const auto deadline = captureStart + 82800000ull;
-        while (GetTickCount64() < deadline) {
-          if (GetTickCount64() >= nextHealth) {
-            std::ofstream health(statePath(L"native-health.json.tmp"),
-                                 std::ios::trunc);
-            health << "{\"running\":true,\"rocDuration\":" << rocGrant.duration
-                   << ",\"transmitted\":" << awdlTxSubmitted
-                   << ",\"ringWraps\":" << ringWraps
-                   << ",\"dataAck\":" << dataUnicastAckCount
-                   << ",\"peerSwitches\":" << peerSwitches
-                   << ",\"otherPeerDropped\":" << hostOtherPeerDropped << "}";
-            health.close();
-            MoveFileExW(statePath(L"native-health.json.tmp").c_str(),
-                        statePath(L"native-health.json").c_str(),
-                        MOVEFILE_REPLACE_EXISTING);
-            nextHealth = GetTickCount64() + 2000;
-          }
-
-          if (WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) break;
-          if (awdlLink->stopping())
-            throw std::runtime_error("The AWDL pipe ended early");
-          waitEvent([](const uint8_t *, size_t) { return false; }, 1);
-
-          if (!hostCandidate.empty() &&
-              monotonicMicros() - hostCandidateAt > 2000000) {
-            hostCandidate.clear();
-            ++hostExpired;
-          }
-          if (hostCandidate.empty() && awdlLink->popData(hostCandidate))
-            hostCandidateAt = monotonicMicros();
-          if (!hostCandidate.empty() && !(hostCandidate[4] & 1)) {
-            std::array<uint8_t, 6> target{};
-            std::copy(hostCandidate.begin() + 4, hostCandidate.begin() + 10,
-                      target.begin());
-            const auto heard = peerReceived(target);
-            if (target != awdlPeer && heard &&
-                monotonicMicros() - heard <= 4000 &&
-                std::none_of(
-                    pendingActions.begin(), pendingActions.end(),
-                    [](const PendingAction &item) { return item.active; })) {
-              if (peerEnabled) {
-                send(mtkPeerRequest(false, 9, awdlPeer));
-                if (!commandReply(9, 3))
-                  throw std::runtime_error(
-                      "Previous peer record could not be retired");
-                peerEnabled = false;
-              }
-              send(mtkPeerRequest(true, 8, target));
-              if (!commandReply(8, 3))
-                throw std::runtime_error(
-                    "Requested host peer record was not acknowledged");
-              peerEnabled = true;
-              awdlPeer = target;
+        if (frame.size() >= 29 && (mtkLe16(frame.data()) & 0xfc) == 0xd0 &&
+            frame[24] == 0x7f && frame[25] == 0 && frame[26] == 0x17 &&
+            frame[27] == 0xf2 && frame[28] == 8) {
+          ++awdlFrames;
+          if (!std::equal(radioAddress.begin(), radioAddress.end(),
+                          frame.begin() + 10)) {
+            if (!(frame[10] & 1) && awdlTxSubmitted && !awdlPeerLearned) {
+              std::copy(frame.begin() + 10, frame.begin() + 16,
+                        awdlPeer.begin());
               awdlPeerLearned = true;
-              peerLastRxUs = peerReceived(target);
-              lastUnicastPeerRxUs = 0;
-              unicastInWindow = 0;
-              ++peerSwitches;
             }
-          }
+            if (awdlPeerLearned && std::equal(awdlPeer.begin(), awdlPeer.end(),
+                                              frame.begin() + 10)) {
+              if (!peerEnabled) {
+                send(mtkPeerRequest(true, 8, awdlPeer));
+                peerEnabled = commandReply(8, 3);
+                if (!peerEnabled)
+                  throw std::runtime_error(
+                      "AWDL peer record was not acknowledged");
 
-          for (unsigned slot = 0;
-               slot < pendingActions.size() && awdlTxSubmitted < 100000000u;
-               ++slot) {
-            if (pendingActions[slot].active) continue;
-            const auto nowUs = monotonicMicros();
-            const bool peerWindow =
-                peerEnabled &&
-                (peerLastRxUs > lastUnicastPeerRxUs || unicastInWindow < 3) &&
-                nowUs - peerLastRxUs <= 4000;
-
-            std::vector<uint8_t> frame;
-            bool hostData = false;
-
-            if (peerWindow && !hostCandidate.empty() &&
-                ((hostCandidate[4] & 1) ||
-                 std::equal(awdlPeer.begin(), awdlPeer.end(),
-                            hostCandidate.begin() + 4))) {
-              frame = std::move(hostCandidate);
-              hostCandidate.clear();
-              hostData = true;
+                // Wait for the next received peer action after setup.
+              } else
+                peerLastRxUs = monotonicMicros();
             }
-
-            if (hostData && !(frame[4] & 1) &&
-                !std::equal(awdlPeer.begin(), awdlPeer.end(),
-                            frame.begin() + 4)) {
-              ++hostOtherPeerDropped;
-              continue;
-            }
-            const bool managementTrial =
-                peerWindow && !hostData && peerLastRxUs > lastUnicastPeerRxUs &&
-                nowUs - lastManagementTrialUs >= 200000 &&
-                awdlUnicastSubmitted < 100000000u && !awdlUnicastAck;
-            const bool unicast =
-                (hostData && !(frame[4] & 1)) || managementTrial;
-
-            if (!hostData && !awdlLink->pop(frame)) break;
-            const auto sequence = uint16_t((awdlTxSubmitted + 1) & 4095);
-            const auto packet =
-                hostData ? mtkAwDlHostRequest(std::move(frame), sequence,
-                                              uint8_t(128 + slot))
-                         : mtkAwDlActionRequest(std::move(frame), sequence,
-                                                uint8_t(128 + slot),
-                                                unicast ? &awdlPeer : nullptr);
-            pendingActions[slot] = {true, unicast, sequence, hostData};
-            if (hostData) ++dataTxSubmitted;
-            if (unicast) {
-              if (!hostData) {
-                awdlUnicastAttempted = true;
-                ++awdlUnicastSubmitted;
-                lastManagementTrialUs = nowUs;
-              }
-              if (peerLastRxUs != lastUnicastPeerRxUs) unicastInWindow = 0;
-              lastUnicastPeerRxUs = peerLastRxUs;
-              ++unicastInWindow;
-              maxUnicastDequeueDelayUs =
-                  (std::max)(maxUnicastDequeueDelayUs, nowUs - peerLastRxUs);
-            }
-            send(packet, 68 + slot);
-            ++awdlTxSubmitted;
-          }
-
-          std::vector<uint8_t> record;
-          if (!mcuFrames.empty()) {
-            record = std::move(mcuFrames.front());
-            mcuFrames.pop_front();
-          } else {
-            MemoryBarrier();
-            const auto control = dataRing[dataTail].ctrl;
-            if (!(control & 0x80000000u)) {
-              Sleep(1);
-              continue;
-            }
-            const unsigned bytes = (control >> 16) & 0x3fff;
-            MemoryBarrier();
-            const auto *data = bufferPointer(36 + dataTail);
-            if (!bytes || bytes > 2048 || assembly.size() + bytes > 16384) {
-              if (!dropping) ++oversizedDropped;
-              dropping = true;
-              assembly.clear();
-            } else if (!dropping)
-              assembly.insert(assembly.end(), data, data + bytes);
-            const bool last = (control & 0x40000000u) != 0;
-            if (!last) ++fragmentedDescriptors;
-            dataRing[dataTail].info = 0;
-            dataRing[dataTail].ctrl = 2048u << 16;
-            MemoryBarrier();
-            operation(handle, 0x2528, REGPROXY_WRITE, dataTail);
-            dataTail = (dataTail + 1) % 32;
-            if (!last) continue;
-            if (dropping) {
-              assembly.clear();
-              dropping = false;
-              continue;
-            }
-            record = std::move(assembly);
-            assembly.clear();
-          }
-          ++dataPackets;
-
-          const auto frame = mtkDot11Frame(record.data(), record.size());
-          if (frame.empty())
-            ++invalidFrames;
-          else {
-            ++rawFrames;
-            if (frame.size() >= 29 &&
-                std::equal(mtkAwDlBssid.begin(), mtkAwDlBssid.end(),
-                           frame.begin() + 16) &&
-                (((mtkLe16(frame.data()) & 0x0c) == 8) ||
-                 (frame[0] == 0xd0 && frame[24] == 0x7f && frame[25] == 0 &&
-                  frame[26] == 0x17 && frame[27] == 0xf2 && frame[28] == 8)))
-              hearPeer(frame.data() + 10);
-            // Addressed AWDL data proves the peer is awake on
-            // our actual channel. Reply within that fresh window
-            // rather than waiting for a later action frame.
-            if (peerEnabled && frame.size() >= 24 &&
-                (mtkLe16(frame.data()) & 0x0c) == 8 &&
-                std::equal(radioAddress.begin(), radioAddress.end(),
-                           frame.begin() + 4) &&
-                std::equal(awdlPeer.begin(), awdlPeer.end(),
-                           frame.begin() + 10) &&
-                std::equal(mtkAwDlBssid.begin(), mtkAwDlBssid.end(),
-                           frame.begin() + 16)) {
-              peerLastRxUs = monotonicMicros();
-              ++peerDataWindows;
-            }
-
-            if (radioTxSubmitted >= 2 &&
-                (mtkLe16(frame.data()) & 0xfc) == 0xd4 && frame.size() == 10 &&
-                std::equal(radioAddress.begin(), radioAddress.end(),
-                           frame.begin() + 4))
-              ++ackFrames;
-            if (frame.size() >= 36 && (mtkLe16(frame.data()) & 0xfc) == 0x50 &&
-                std::equal(radioAddress.begin(), radioAddress.end(),
-                           frame.begin() + 4))
-              ++probeResponses;
-            if (frame.size() >= 29 && (mtkLe16(frame.data()) & 0xfc) == 0xd0 &&
-                frame[24] == 0x7f && frame[25] == 0 && frame[26] == 0x17 &&
-                frame[27] == 0xf2 && frame[28] == 8) {
-              ++awdlFrames;
-              if (!std::equal(radioAddress.begin(), radioAddress.end(),
-                              frame.begin() + 10)) {
-                if (!(frame[10] & 1) && awdlTxSubmitted && !awdlPeerLearned) {
-                  std::copy(frame.begin() + 10, frame.begin() + 16,
-                            awdlPeer.begin());
-                  awdlPeerLearned = true;
-                }
-                if (awdlPeerLearned &&
-                    std::equal(awdlPeer.begin(), awdlPeer.end(),
-                               frame.begin() + 10)) {
-                  if (!peerEnabled) {
-                    send(mtkPeerRequest(true, 8, awdlPeer));
-                    peerEnabled = commandReply(8, 3);
-                    if (!peerEnabled)
-                      throw std::runtime_error(
-                          "AWDL peer record was not acknowledged");
-
-                    // Wait for the next received peer action after setup.
-                  } else
-                    peerLastRxUs = monotonicMicros();
-                }
-                if (mtkAwDlPeerReferences(frame, radioAddress))
-                  awdlPeerReferenced = true;
-              }
-            }
-            if (!awdlLink->receive(frame))
-              throw std::runtime_error("AWDL receive forwarding failed");
+            if (mtkAwDlPeerReferences(frame, radioAddress))
+              awdlPeerReferenced = true;
           }
         }
-
-      } catch (const std::exception &failure) {
-        error = failure.what();
+        if (!awdlLink->receive(frame))
+          throw std::runtime_error("AWDL receive forwarding failed");
       }
-      if (awdlLink) {
-        awdlLink->stop();
-        hostInterfaceIndex = awdlLink->hostIndex();
-        hostUnicastDropped = awdlLink->unicastDropped();
-        hostMulticastDropped = awdlLink->multicastDropped();
-        awdlLink.reset();
-
-        if (!hostInterfaceIndex && error.empty())
-          error = "The owned AWDL host interface was not verified";
-      }
-      // Firmware state is restored even if an enable reply was lost.
-
-      try {
-        send(mtkSnifferRequest(false, 4));
-        snifferDisabled = commandReply(4, 0x24);
-      } catch (const std::exception &failure) {
-        if (error.empty()) error = failure.what();
-      }
-      if (rocAttempted) {
-        try {
-          send(mtkRocRequest(false, 14));
-          rocAborted = commandReply(14, 0x27);
-        } catch (const std::exception &failure) {
-          if (error.empty()) error = failure.what();
-        }
-        if (!rocAborted && error.empty())
-          error = "Channel privilege cleanup was not acknowledged";
-      }
-      if (peerEnabled) {
-        try {
-          send(mtkPeerRequest(false, 9, radioAddress));
-          peerDisabled = commandReply(9, 3);
-        } catch (const std::exception &failure) {
-          if (error.empty()) error = failure.what();
-        }
-      }
-
-      try {
-        send(mtkBssRequest(false, 10, radioAddress));
-        bssDisabled = commandReply(10, 2);
-      } catch (const std::exception &failure) {
-        if (error.empty()) error = failure.what();
-      }
-      try {
-        send(mtkDeviceRequest(false, 11, radioAddress));
-        deviceDisabled = commandReply(11, 1);
-      } catch (const std::exception &failure) {
-        if (error.empty()) error = failure.what();
-      }
-
-      try {
-        send(mtkRadioRequest(false, 5));
-        radioDisabled = commandReply(5, 8);
-      } catch (const std::exception &failure) {
-        if (error.empty()) error = failure.what();
-      }
-      if (clockAttempted) {
-        try {
-          send(mtkClockRequest(false, 12));
-          clockDisabled = commandReply(12, 0x0f);
-        } catch (const std::exception &failure) {
-          if (error.empty()) error = failure.what();
-        }
-        if (!clockDisabled && error.empty())
-          error = "Band-gap clock cleanup was not acknowledged";
-      }
-      if ((!snifferDisabled || !radioDisabled) && error.empty())
-        error = "Firmware radio cleanup was not acknowledged";
-
-      if ((!deviceDisabled || !bssDisabled || (peerEnabled && !peerDisabled)) &&
-          error.empty())
-        error = "AWDL MAC context cleanup was not acknowledged";
     }
-  } catch (const std::exception &failure) {
-    error = failure.what();
   }
-  if (token) CloseHandle(token);
-  if (handle != INVALID_HANDLE_VALUE) {
-    stopped = programmed ? stopDma(handle) : true;
-    CloseHandle(handle);
-  }
-  if (programmed && !stopped) {
-    // Keep the pages allocated if hardware shutdown is uncertain. The
-    // independent supervisor restores the OEM driver before allowing release.
-    std::ofstream pending(reportPath, std::ios::trunc);
-    pending << "{\"state\":\"waiting-for-oem-recovery\",\"pagesHeld\":true,"
-               "\"ringAddress\":"
-            << ringAddress << ",\"dmaValidated\":false}";
-    pending.close();
-    while (GetFileAttributesW(releasePath.c_str()) == INVALID_FILE_ATTRIBUTES)
-      Sleep(500);
-  }
-  if (mapped && !MapUserPhysicalPages(view, count, nullptr)) freed = false;
-  if (view && !VirtualFree(view, 0, MEM_RELEASE)) freed = false;
-  if (count) {
-    ULONG_PTR released = count;
-    if (!FreeUserPhysicalPages(GetCurrentProcess(), &released, frames.data()) ||
-        released != count)
-      freed = false;
-  }
-  const bool transmitVerified =
-      awdlPeerReferenced || awdlUnicastAck || dataTxAck;
-  std::ofstream report(reportPath, std::ios::trunc);
-  report << std::boolalpha
-         << "{\"state\":\"completed\",\"hardwareProgrammed\":" << programmed
-         << ",\"dmaValidated\":" << done << ",\"ringAddress\":" << ringAddress
-         << ",\"setupBase\":" << setupBase << ",\"setupIndex\":" << setupIndex
-         << ",\"dmaIndex\":" << dmaIndex
-         << ",\"descriptorControl\":" << descriptorControl
-         << ",\"dmaStopped\":" << stopped << ",\"allPagesReleased\":" << freed
-         << ",\"allocationMiB\":" << allocationMiB
-         << ",\"allocationFlags\":" << allocationFlags
-         << ",\"allocationAttempts\":" << allocationAttempts
-         << ",\"allocatedPages\":" << count
-         << ",\"lowPagesAvailable\":" << lowPagesAvailable
-         << ",\"lowPagesRequired\":" << lowPagesRequired
-         << ",\"receivedEvents\":" << receivedEvents
-         << ",\"rawFrames\":" << rawFrames << ",\"awdlFrames\":" << awdlFrames
-         << ",\"invalidFrames\":" << invalidFrames
-         << ",\"transmitted\":" << awdlTxSubmitted
-         << ",\"firmwareCompleted\":" << awdlTxFirmwareCompleted
-         << ",\"dataAck\":" << dataUnicastAckCount
-         << ",\"dataFailed\":" << dataUnicastFailedCount
-         << ",\"ringWraps\":" << ringWraps
-         << ",\"peerSwitches\":" << peerSwitches
-         << ",\"hostExpired\":" << hostExpired
-         << ",\"hostUnicastDropped\":" << hostUnicastDropped
-         << ",\"hostMulticastDropped\":" << hostMulticastDropped
-         << ",\"maxUnicastDequeueDelayUs\":" << maxUnicastDequeueDelayUs
-         << ",\"fragmentedDescriptors\":" << fragmentedDescriptors
-         << ",\"oversizedDropped\":" << oversizedDropped
-         << ",\"controlDataDrained\":" << controlDataDrained
-         << ",\"mcuForwardedFrames\":" << mcuForwardedFrames
-         << ",\"rawRadioTransmitVerified\":" << transmitVerified
-         << ",\"error\":" << jsonString(error) << "}";
-  report.close();
+  void stopRadio() {
+    if (awdlLink) {
+      awdlLink->stop();
+      hostInterfaceIndex = awdlLink->hostIndex();
+      hostUnicastDropped = awdlLink->unicastDropped();
+      hostMulticastDropped = awdlLink->multicastDropped();
+      awdlLink.reset();
 
-  std::ofstream health(statePath(L"native-health.json.tmp"), std::ios::trunc);
-  health << std::boolalpha
-         << "{\"running\":false,\"state\":\"ended\",\"dmaStopped\":" << stopped
-         << ",\"allPagesReleased\":" << freed
-         << ",\"transmitted\":" << awdlTxSubmitted << '}';
-  health.close();
-  MoveFileExW(statePath(L"native-health.json.tmp").c_str(),
-              statePath(L"native-health.json").c_str(),
-              MOVEFILE_REPLACE_EXISTING);
+      if (!hostInterfaceIndex && error.empty())
+        error = "The owned AWDL host interface was not verified";
+    }
+    // Firmware state is restored even if an enable reply was lost.
 
-  return report.good() && done && stopped && freed && error.empty() ? 0 : 3;
+    try {
+      send(mtkSnifferRequest(false, 4));
+      snifferDisabled = commandReply(4, 0x24);
+    } catch (const std::exception &failure) {
+      if (error.empty()) error = failure.what();
+    }
+    if (rocAttempted) {
+      try {
+        send(mtkRocRequest(false, 14));
+        rocAborted = commandReply(14, 0x27);
+      } catch (const std::exception &failure) {
+        if (error.empty()) error = failure.what();
+      }
+      if (!rocAborted && error.empty())
+        error = "Channel privilege cleanup was not acknowledged";
+    }
+    if (peerEnabled) {
+      try {
+        send(mtkPeerRequest(false, 9, radioAddress));
+        peerDisabled = commandReply(9, 3);
+      } catch (const std::exception &failure) {
+        if (error.empty()) error = failure.what();
+      }
+    }
+
+    try {
+      send(mtkBssRequest(false, 10, radioAddress));
+      bssDisabled = commandReply(10, 2);
+    } catch (const std::exception &failure) {
+      if (error.empty()) error = failure.what();
+    }
+    try {
+      send(mtkDeviceRequest(false, 11, radioAddress));
+      deviceDisabled = commandReply(11, 1);
+    } catch (const std::exception &failure) {
+      if (error.empty()) error = failure.what();
+    }
+
+    try {
+      send(mtkRadioRequest(false, 5));
+      radioDisabled = commandReply(5, 8);
+    } catch (const std::exception &failure) {
+      if (error.empty()) error = failure.what();
+    }
+    if (clockAttempted) {
+      try {
+        send(mtkClockRequest(false, 12));
+        clockDisabled = commandReply(12, 0x0f);
+      } catch (const std::exception &failure) {
+        if (error.empty()) error = failure.what();
+      }
+      if (!clockDisabled && error.empty())
+        error = "Band-gap clock cleanup was not acknowledged";
+    }
+    if ((!snifferDisabled || !radioDisabled) && error.empty())
+      error = "Firmware radio cleanup was not acknowledged";
+
+    if ((!deviceDisabled || !bssDisabled || (peerEnabled && !peerDisabled)) &&
+        error.empty())
+      error = "AWDL MAC context cleanup was not acknowledged";
+  }
+  int releaseAndReport() {
+    if (token) CloseHandle(token);
+    if (handle != INVALID_HANDLE_VALUE) {
+      stopped = programmed ? stopDma(handle) : true;
+      CloseHandle(handle);
+    }
+    if (programmed && !stopped) {
+      // Keep the pages allocated if hardware shutdown is uncertain. The
+      // independent supervisor restores the OEM driver before allowing release.
+      std::ofstream pending(reportPath, std::ios::trunc);
+      pending << "{\"state\":\"waiting-for-oem-recovery\",\"pagesHeld\":true,"
+                 "\"ringAddress\":"
+              << ringAddress << ",\"dmaValidated\":false}";
+      pending.close();
+      while (GetFileAttributesW(releasePath.c_str()) == INVALID_FILE_ATTRIBUTES)
+        Sleep(500);
+    }
+    if (mapped && !MapUserPhysicalPages(view, count, nullptr)) freed = false;
+    if (view && !VirtualFree(view, 0, MEM_RELEASE)) freed = false;
+    if (count) {
+      ULONG_PTR released = count;
+      if (!FreeUserPhysicalPages(GetCurrentProcess(), &released,
+                                 frames.data()) ||
+          released != count)
+        freed = false;
+    }
+    const bool transmitVerified =
+        awdlPeerReferenced || awdlUnicastAck || dataTxAck;
+    std::ofstream report(reportPath, std::ios::trunc);
+    report << std::boolalpha
+           << "{\"state\":\"completed\",\"hardwareProgrammed\":" << programmed
+           << ",\"dmaValidated\":" << done << ",\"ringAddress\":" << ringAddress
+           << ",\"setupBase\":" << setupBase << ",\"setupIndex\":" << setupIndex
+           << ",\"dmaIndex\":" << dmaIndex
+           << ",\"descriptorControl\":" << descriptorControl
+           << ",\"dmaStopped\":" << stopped << ",\"allPagesReleased\":" << freed
+           << ",\"allocationMiB\":" << allocationMiB
+           << ",\"allocationFlags\":" << allocationFlags
+           << ",\"allocationAttempts\":" << allocationAttempts
+           << ",\"allocatedPages\":" << count
+           << ",\"lowPagesAvailable\":" << lowPagesAvailable
+           << ",\"lowPagesRequired\":" << lowPagesRequired
+           << ",\"receivedEvents\":" << receivedEvents
+           << ",\"dataPackets\":" << dataPackets
+           << ",\"peerDataWindows\":" << peerDataWindows
+           << ",\"rawFrames\":" << rawFrames << ",\"awdlFrames\":" << awdlFrames
+           << ",\"invalidFrames\":" << invalidFrames
+           << ",\"transmitted\":" << awdlTxSubmitted
+           << ",\"firmwareCompleted\":" << awdlTxFirmwareCompleted
+           << ",\"dataAck\":" << dataUnicastAckCount
+           << ",\"dataFailed\":" << dataUnicastFailedCount
+           << ",\"ringWraps\":" << ringWraps
+           << ",\"peerSwitches\":" << peerSwitches
+           << ",\"hostExpired\":" << hostExpired
+           << ",\"hostUnicastDropped\":" << hostUnicastDropped
+           << ",\"hostMulticastDropped\":" << hostMulticastDropped
+           << ",\"maxUnicastDequeueDelayUs\":" << maxUnicastDequeueDelayUs
+           << ",\"fragmentedDescriptors\":" << fragmentedDescriptors
+           << ",\"oversizedDropped\":" << oversizedDropped
+           << ",\"controlDataDrained\":" << controlDataDrained
+           << ",\"mcuForwardedFrames\":" << mcuForwardedFrames
+           << ",\"rawRadioTransmitVerified\":" << transmitVerified
+           << ",\"error\":" << jsonString(error) << "}";
+    report.close();
+
+    std::ofstream health(statePath(L"native-health.json.tmp"), std::ios::trunc);
+    health << std::boolalpha
+           << "{\"running\":false,\"state\":\"ended\",\"dmaStopped\":"
+           << stopped << ",\"allPagesReleased\":" << freed
+           << ",\"transmitted\":" << awdlTxSubmitted << '}';
+    health.close();
+    MoveFileExW(statePath(L"native-health.json.tmp").c_str(),
+                statePath(L"native-health.json").c_str(),
+                MOVEFILE_REPLACE_EXISTING);
+
+    return report.good() && done && stopped && freed && error.empty() ? 0 : 3;
+  }
+};
+
+int runMediaTekSession(HANDLE stopEvent) {
+  return MediaTekSession(stopEvent).run();
 }
