@@ -51,15 +51,18 @@ class RefusingReceiver:
                 connection, _ = self.sock.accept()
             except OSError:
                 return
-            with connection:
-                connection.settimeout(2)
+            # A handshake done by wrap_socket closes the socket when it fails.
+            with self.context.wrap_socket(connection, server_side=True,
+                                          do_handshake_on_connect=False) as secured:
+                secured.settimeout(2)
                 try:
-                    self.context.wrap_socket(connection, server_side=True).close()
+                    secured.do_handshake()
                 except OSError:
                     # Closing with the client's request unread would reset the
                     # connection before the client has read the alert.
                     try:
-                        while connection.recv(4096):
+                        secured.shutdown(socket.SHUT_WR)
+                        while secured.recv(4096):
                             pass
                     except OSError:
                         pass
