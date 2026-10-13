@@ -84,6 +84,20 @@ function Stop-Radio {
   } while ((Get-Date) -lt $deadline)
   throw 'Radio is still recovering; it was left running to protect DMA memory.'
 }
+function Stop-BackgroundApp {
+  # Stop only this installation's GUI and engine after radio recovery.
+  $paths = @("$target\build\app\winawdl\winawdl.exe", "$target\runtime\python\python.exe")
+  Get-Process winawdl,python -ErrorAction SilentlyContinue | Where-Object {
+    $_.Path -in $paths
+  } | Stop-Process -ErrorAction Stop
+  $deadline = (Get-Date).AddSeconds(10)
+  do {
+    $task = Get-ScheduledTask -TaskName $guiName -ErrorAction SilentlyContinue
+    if (-not $task -or $task.State -ne 'Running') { return }
+    Start-Sleep -Milliseconds 250
+  } while ((Get-Date) -lt $deadline)
+  throw 'The background app did not exit before updating its files.'
+}
 function Radio-Task([bool]$permanent) {
   $args = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$target+'\scripts\start-mediatek-background.ps1"'
   if (-not $permanent) {
@@ -108,6 +122,7 @@ if ($Mode -eq 'Stop') {
 }
 if ($Mode -eq 'Uninstall') {
   Stop-Radio
+  Stop-BackgroundApp
   $install = Get-Content -LiteralPath "$target\installation.json" -Raw | ConvertFrom-Json
   foreach ($name in $taskName,$guiName) {
     Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
@@ -127,6 +142,7 @@ if ($Mode -eq 'Stage') {
   if ((Test-Path -LiteralPath $target) -and -not (Test-Path -LiteralPath "$target\installation.json")) {
     throw 'The target folder belongs to another installation.'
   }
+  Stop-BackgroundApp
   $owner = [Security.Principal.WindowsIdentity]::GetCurrent()
   if ($owner.User.Value -eq 'S-1-5-18') {
     throw 'Run initial installation as the interactive owner.'
@@ -157,7 +173,7 @@ if ($Mode -eq 'Stage') {
   }
   Get-ChildItem -LiteralPath "$source\airdrop" -File | Where-Object Extension -eq '.py' | Copy-Item -Destination "$target\airdrop" -Force
   Copy-Item "$source\mediatek\profiles\*.json" "$target\mediatek\profiles" -Force
-  foreach ($part in 'LICENSE','airdrop\LICENSE','awdl\LICENSE','radio\LICENSE','deps\wintun\LICENSE.txt') {
+  foreach ($part in 'LICENSE','airdrop\LICENSE','awdl\LICENSE','radio\LICENSE','deps\wintun\LICENSE.txt','LICENSES\BSD-3-Clause-Clear.txt') {
     if (Test-Path -LiteralPath (Join-Path $source $part)) {
       Copy-Item -LiteralPath (Join-Path $source $part) -Destination (Join-Path "$target\licenses" ($part.Replace('\','-'))) -Force
     }
