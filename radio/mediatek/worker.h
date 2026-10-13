@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#pragma once
+#include "device_io.h"
+int runMediaTekSession(HANDLE stopEvent);

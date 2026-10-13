@@ -1,0 +1,61 @@
+; SPDX-License-Identifier: MIT
+; MT7925 PCI register access for the AWDL radio worker.
+[Version]
+Signature = "$Windows NT$"
+Class = WinAwdlRadio
+ClassGuid = {42c93386-3172-4834-9a73-d5dbe38443f8}
+Provider = %Provider%
+CatalogFile = winawdl_mt7925_mcu.cat
+DriverVer = 10/12/2026,0.1.0.1
+PnpLockdown = 1
+
+[ClassInstall32]
+AddReg = Class_AddReg
+[Class_AddReg]
+HKR,,,,%ClassName%
+HKR,,Icon,,"-5"
+
+[Manufacturer]
+%Provider% = Models, NTamd64.10.0...19041
+[Models.NTamd64.10.0...19041]
+%DeviceDesc% = MtkProbe, PCI\VEN_14C3&DEV_7925&SUBSYS_E112105B
+
+[SourceDisksNames]
+1 = %DiskName%
+[SourceDisksFiles]
+winawdl_mt7925_mcu.dll = 1
+[DestinationDirs]
+Probe_Copy = 13
+
+[MtkProbe.NT]
+CopyFiles = Probe_Copy
+Include = WUDFRD.inf
+Needs = WUDFRD.NT
+[Probe_Copy]
+winawdl_mt7925_mcu.dll
+
+[MtkProbe.NT.HW]
+Include = WUDFRD.inf
+Needs = WUDFRD.NT.HW
+AddReg = Probe_HwAddReg
+[Probe_HwAddReg]
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[MtkProbe.NT.Services]
+Include = WUDFRD.inf
+Needs = WUDFRD.NT.Services
+
+[MtkProbe.NT.Wdf]
+UmdfService = winawdl_mt7925_mcu, Probe_Umdf
+UmdfServiceOrder = winawdl_mt7925_mcu
+UmdfDirectHardwareAccess = AllowDirectHardwareAccess
+UmdfRegisterAccessMode = RegisterAccessUsingUserModeMapping
+[Probe_Umdf]
+UmdfLibraryVersion = 2.33.0
+ServiceBinary = %13%\winawdl_mt7925_mcu.dll
+
+[Strings]
+Provider = "winawdl"
+ClassName = "winawdl user-space radios"
+DeviceDesc = "MT7925 AWDL radio"
+DiskName = "winawdl MT7925 radio"

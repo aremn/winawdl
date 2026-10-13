@@ -9,9 +9,14 @@
 #include "regproxy_ioctl.h"
 #include <ntstatus.h>
 #include <wdf.h>
+#ifdef WINAWDL_MT7925
+#include "../mediatek/register_access.h"
+#endif
 
 /* The 8852CE register window (BAR2) is 1 MiB; smaller resources are not it. */
+#ifndef MIN_BAR_LEN
 #define MIN_BAR_LEN 0x10000u
+#endif
 
 typedef struct _DEVICE_CONTEXT {
   PVOID bar; /* pseudo base address, only valid for the WDF register macros */
@@ -100,6 +105,10 @@ NTSTATUS RpEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated) {
   UNREFERENCED_PARAMETER(Translated);
   DEVICE_CONTEXT *ctx = GetCtx(Device);
   if (ctx->bar) {
+#ifdef WINAWDL_MT7925
+    PULONG global = (PULONG)((PUCHAR)ctx->bar + 0x2208);
+    WDF_WRITE_REGISTER_ULONG(Device, global, WDF_READ_REGISTER_ULONG(Device, global) & ~5u);
+#endif
     WdfDeviceUnmapIoSpace(Device, ctx->bar, ctx->bar_len);
     ctx->bar = NULL;
     ctx->bar_len = 0;
@@ -109,6 +118,9 @@ NTSTATUS RpEvtReleaseHardware(WDFDEVICE Device, WDFCMRESLIST Translated) {
 }
 
 static BOOLEAN op_is_valid(const REGPROXY_OP *op, SIZE_T bar_len) {
+#ifdef WINAWDL_MT7925
+  if (!mtkRegisterOperationIsValid(op)) return FALSE;
+#endif
   if (op->width != 1 && op->width != 2 && op->width != 4) return FALSE;
   if (op->kind > REGPROXY_CLEAR_BITS) return FALSE;
   if (op->offset & (op->width - 1u)) return FALSE;
@@ -256,6 +268,12 @@ VOID RpEvtFileCreate(WDFDEVICE Device, WDFREQUEST Request,
 VOID RpEvtFileCleanup(WDFFILEOBJECT FileObject) {
   WDFDEVICE dev = WdfFileObjectGetDevice(FileObject);
   DEVICE_CONTEXT *ctx = GetCtx(dev);
+#ifdef WINAWDL_MT7925
+  if (ctx->bar) {
+    PULONG global = (PULONG)((PUCHAR)ctx->bar + 0x2208);
+    WDF_WRITE_REGISTER_ULONG(dev, global, WDF_READ_REGISTER_ULONG(dev, global) & ~5u);
+  }
+#endif
   if (ctx->bar)
     for (size_t i = 0; i < ctx->close_op_count; i++)
       run_op(dev, (PUCHAR)ctx->bar + ctx->close_ops[i].offset,

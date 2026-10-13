@@ -1,0 +1,15 @@
+{
+  "schema": 3,
+  "id": "mt7925-5.4.0.2974",
+  "driverVersion": "5.4.0.2974",
+  "sha256": "c686c725c66b2ed3eb0e5379ac59b8ac4a07b85e6750cf9154d45a99d37aa477",
+  "hardwarePrefix": "PCI\\VEN_14C3&DEV_7925&SUBSYS_E112105B",
+  "controlDevice": "\\\\.\\MTKWLAN",
+  "firmwareQueryOid": 4294766599,
+  "firmwareBufferBytes": 100,
+  "firmwareVersionOffset": 17,
+  "firmwareVersionBytes": 15,
+  "radioLinkVersion": 3,
+  "firmwareBundleSha256": "c15ffe2aa9dd2b6ece956b2e3763427490bc3d2b829cce0ccece92e89d310a2d",
+  "firmwareVersion": "20241206164307"
+}
