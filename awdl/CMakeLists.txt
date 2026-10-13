@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# AWDL daemon: OWL's library and event core, unmodified, on a Windows I/O layer.
+# AWDL daemon: OWL core on Windows, with explicit RX metadata defaults.
 # OWL is GNU C, hence a MinGW build apart from the MSVC radio side.
 cmake_minimum_required(VERSION 3.15)
 project(winawdl_awdl C)
@@ -25,10 +25,23 @@ target_link_libraries(radiotap PRIVATE owl_build)
 # on Windows. The differences are small, so the truncation cancels out.
 target_compile_options(radiotap PRIVATE -Wno-pointer-to-int-cast)
 
-set(OWL_SOURCES log state election sync channel schedule tx rx frame crc32 wire
+set(OWL_SOURCES log state election sync channel schedule tx frame crc32 wire
     peers version hashmap siphash24 circular_buffer)
 list(TRANSFORM OWL_SOURCES PREPEND "${OWL}/src/")
 list(TRANSFORM OWL_SOURCES APPEND ".c")
+# OWL's RX parser leaves RSSI/FLAGS uninitialized when radiotap omits them.
+# Keep the pinned source checkout intact and compile a reviewed copy.
+file(READ "${OWL}/src/rx.c" OWL_RX_SOURCE)
+foreach(FIELD "signed char rssi;" "uint8_t flags;")
+    string(FIND "${OWL_RX_SOURCE}" "${FIELD}" FIELD_POSITION)
+    if(FIELD_POSITION EQUAL -1)
+        message(FATAL_ERROR "Review OWL RX defaults after updating its source")
+    endif()
+endforeach()
+string(REPLACE "signed char rssi;" "signed char rssi = 0;" OWL_RX_SOURCE "${OWL_RX_SOURCE}")
+string(REPLACE "uint8_t flags;" "uint8_t flags = 0;" OWL_RX_SOURCE "${OWL_RX_SOURCE}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/owl_rx.c" "${OWL_RX_SOURCE}")
+list(APPEND OWL_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/owl_rx.c")
 add_library(awdl STATIC ${OWL_SOURCES})
 target_link_libraries(awdl PUBLIC owl_build radiotap)
 
@@ -55,6 +68,13 @@ add_executable(host_frame_test tests/host_frame_test.c)
 target_compile_options(host_frame_test PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(host_frame_test PRIVATE host_if)
 target_link_options(host_frame_test PRIVATE -static)
+
+# Explicit Administrator integration check; never part of unit test runs.
+# Creates only the owned temporary Wintun, with no radio or phone traffic.
+add_executable(host_neighbor_test tests/host_neighbor_test.c)
+target_compile_options(host_neighbor_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(host_neighbor_test PRIVATE host_if iphlpapi)
+target_link_options(host_neighbor_test PRIVATE -static)
 
 add_executable(tcp_merge_test tests/tcp_merge_test.c win/tcp_merge.c)
 target_include_directories(tcp_merge_test PRIVATE win)

@@ -1,10 +1,15 @@
 # Builds the AWDL daemon in awdl\ with MinGW-w64 GCC. Output lands in
 # build\awdl. OWL is GNU C, which Microsoft's compiler does not accept.
+param([string]$MinGw)
 $ErrorActionPreference = 'Stop'
 
 $repo  = Split-Path $PSScriptRoot -Parent
 $build = "$repo\build\awdl"
-$mingw = 'C:\Strawberry\c\bin'
+$mingw = if ($MinGw) { $MinGw } else {
+  $gcc = Get-Command gcc.exe -ErrorAction SilentlyContinue
+  if (-not $gcc) { throw 'MinGW-w64 GCC is required. Pass -MinGw with its bin directory.' }
+  Split-Path $gcc.Source -Parent
+}
 if (-not (Test-Path "$mingw\gcc.exe")) { throw "MinGW-w64 GCC not found in $mingw" }
 if (-not (Test-Path "$repo\upstream\owl\radiotap\radiotap.c")) {
   throw 'OWL radiotap sources missing: run "git -C upstream/owl submodule update --init radiotap".'

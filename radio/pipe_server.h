@@ -44,6 +44,10 @@ public:
 
   bool valid() const { return _handle != INVALID_HANDLE_VALUE; }
   bool connected() const { return _connected; }
+  DWORD client_process_id() const {
+    ULONG process = 0;
+    return GetNamedPipeClientProcessId(_handle, &process) ? process : 0;
+  }
 
   /* A client that connected and already left still counts as connected here:
    * its departure shows up as a failed first read. */

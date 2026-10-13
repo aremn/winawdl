@@ -33,6 +33,23 @@ static struct pcap wlan;
 /* NULL when the adapter could not be created; data frames are then dropped. */
 static struct host_if *host;
 
+int winawdl_neighbor_add(int ifindex, const uint8_t address[16], const uint8_t physical[6]) {
+	if (!host || ifindex != (int) host_if_index(host))
+		return -ENODEV;
+	unsigned long error = host_if_neighbor_add(host, address, physical);
+	if (error)
+		log_warn("AWDL neighbor registration failed (error %lu)", error);
+	else
+		log_info("AWDL neighbor registered on the owned host adapter");
+	return error ? -EIO : 0;
+}
+
+int winawdl_neighbor_remove(int ifindex, const uint8_t address[16]) {
+	if (!host || ifindex != (int) host_if_index(host))
+		return -ENODEV;
+	return host_if_neighbor_remove(host, address) ? -EIO : 0;
+}
+
 struct radio_client *winawdl_radio(void) {
 	return wlan.radio;
 }

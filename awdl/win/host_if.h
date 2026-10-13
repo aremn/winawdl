@@ -27,3 +27,6 @@ unsigned long host_if_index(const struct host_if *host);
 int host_if_read(struct host_if *host, uint8_t *packet);
 /* Hands a packet to the host. Returns -1 when the adapter's queue is full. */
 int host_if_write(struct host_if *host, const uint8_t *packet, int len);
+/* Peer entries exist only on this owned adapter, until peer removal or close. */
+unsigned long host_if_neighbor_add(struct host_if *host, const uint8_t address[16], const uint8_t physical[6]);
+unsigned long host_if_neighbor_remove(struct host_if *host, const uint8_t address[16]);

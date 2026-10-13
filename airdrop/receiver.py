@@ -97,7 +97,11 @@ class Receiver(ThreadingHTTPServer):
 
     def verify_request(self, request, client_address):
         # The socket listens on every interface; AirDrop only arrives on one.
-        return client_address[3] == self.settings.interface_index
+        accepted = client_address[3] == self.settings.interface_index
+        if not accepted:
+            logging.info('connection rejected: interface scope %d, expected %d',
+                         client_address[3], self.settings.interface_index)
+        return accepted
 
     def process_request(self, request, client_address):
         logging.info('connection from [%s]:%s', client_address[0], client_address[1])

@@ -415,7 +415,8 @@ class Looking:
             if found and still_there:
                 peer.name, peer.model = found
         if found and still_there:
-            self.events.say('peer', id=key, name=peer.name, model=peer.model)
+            self.events.say('peer', id=key, name=peer.name, model=peer.model,
+                            address=peer.address)
 
 
 class SendWatch(sender.Watch):

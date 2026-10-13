@@ -212,6 +212,10 @@ int radio_client_pop(struct radio_client *client, uint8_t *frame) {
 		memcpy(frame, slot->frame, (size_t) length);
 		client->head = (client->head + 1) % SLOT_COUNT;
 		client->count--;
+		/* A burst can collapse into one auto-reset wake. Keep waking the
+		 * event loop until the frames already queued have been consumed. */
+		if (client->count > 0)
+			SetEvent(client->rx_event);
 	}
 	LeaveCriticalSection(&client->queue_lock);
 	return length;

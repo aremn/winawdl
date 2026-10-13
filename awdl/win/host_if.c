@@ -197,6 +197,43 @@ unsigned long host_if_index(const struct host_if *host) {
 	return index;
 }
 
+unsigned long host_if_neighbor_add(struct host_if *host, const uint8_t address[16], const uint8_t physical[6]) {
+	MIB_IF_ROW2 interface_row = {0};
+	interface_row.InterfaceLuid = host->luid;
+	DWORD error = GetIfEntry2(&interface_row);
+	if (error != NO_ERROR)
+		return error;
+	if (interface_row.PhysicalAddressLength != 0 && interface_row.PhysicalAddressLength != 6)
+		return ERROR_NOT_SUPPORTED;
+	MIB_IPNET_ROW2 row = {0};
+	row.InterfaceLuid = host->luid;
+	row.Address.Ipv6.sin6_family = AF_INET6;
+	memcpy(&row.Address.Ipv6.sin6_addr, address, 16);
+	if (!IN6_IS_ADDR_LINKLOCAL(&row.Address.Ipv6.sin6_addr) || (physical[0] & 1))
+		return ERROR_INVALID_PARAMETER;
+	/* Preserve the link's real address length: Wintun is an IP tunnel with
+	 * no Ethernet header. Availability is determined by OWL's peer table. */
+	row.PhysicalAddressLength = interface_row.PhysicalAddressLength;
+	if (row.PhysicalAddressLength)
+		memcpy(row.PhysicalAddress, physical, 6);
+	row.State = NlnsPermanent;
+	error = CreateIpNetEntry2(&row);
+	if (error == ERROR_OBJECT_ALREADY_EXISTS)
+		error = SetIpNetEntry2(&row);
+	if (error != NO_ERROR)
+		return error;
+	error = GetIpNetEntry2(&row);
+	return error != NO_ERROR ? error : (row.State == NlnsPermanent ? NO_ERROR : ERROR_INVALID_STATE);
+}
+
+unsigned long host_if_neighbor_remove(struct host_if *host, const uint8_t address[16]) {
+	MIB_IPNET_ROW2 row = {0};
+	row.InterfaceLuid = host->luid;
+	row.Address.Ipv6.sin6_family = AF_INET6;
+	memcpy(&row.Address.Ipv6.sin6_addr, address, 16);
+	return DeleteIpNetEntry2(&row);
+}
+
 int host_if_read(struct host_if *host, uint8_t *packet) {
 	DWORD size = 0;
 	BYTE *received = host->api.ReceivePacket(host->session, &size);

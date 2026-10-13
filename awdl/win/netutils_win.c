@@ -63,19 +63,15 @@ int get_hostname(char *name, size_t len) {
 	return GetComputerNameA(name, &size) ? 0 : -EIO;
 }
 
-/* The host adapter carries bare IP packets, so Windows never resolves a
- * neighbor on it: peer MACs are read back out of the destination address. */
+/* Wintun carries IP; OWL knows which peers exist and owns their lifetime.
+ * Install this information only on our host adapter, rather than letting
+ * Windows mark a radio peer unreachable while awaiting Ethernet-style NUD. */
 int neighbor_add(int ifindex, const struct ether_addr *eth, const struct in6_addr *in6) {
-	(void) ifindex;
-	(void) eth;
-	(void) in6;
-	return 0;
+	return winawdl_neighbor_add(ifindex, in6->s6_addr, eth->ether_addr_octet);
 }
 
 int neighbor_remove(int ifindex, const struct in6_addr *in6) {
-	(void) ifindex;
-	(void) in6;
-	return 0;
+	return winawdl_neighbor_remove(ifindex, in6->s6_addr);
 }
 
 int neighbor_add_rfc4291(int ifindex, const struct ether_addr *eth) {
@@ -87,13 +83,15 @@ int neighbor_add_rfc4291(int ifindex, const struct ether_addr *eth) {
 	log_info("peer %s is reachable at fe80::%x:%x:%x:%x%%%d", ether_ntoa(eth),
 		 id[0] << 8 | id[1], id[2] << 8 | id[3], id[4] << 8 | id[5], id[6] << 8 | id[7],
 		 ifindex);
-	return 0;
+	return neighbor_add(ifindex, eth, &in6);
 }
 
 int neighbor_remove_rfc4291(int ifindex, const struct ether_addr *eth) {
-	(void) ifindex;
-	(void) eth;
-	return 0;
+	if (ifindex == 0)
+		return 0;
+	struct in6_addr in6;
+	rfc4291_addr(eth, &in6);
+	return neighbor_remove(ifindex, &in6);
 }
 
 /* Link-local address from a MAC: fe80::/64 plus the modified EUI-64. */
