@@ -22,17 +22,30 @@ public sealed class RadioControl : IRadio
     private Process? _supervisor;
     private EventWaitHandle? _stop;
     private int _starts;
+    private bool _installed;
+    private DateTime _installedStartAt;
+    private const string InstalledTask = "winawdl-MediaTek-Radio";
+    private static readonly string InstalledState = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "winawdl", "radio");
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern IntPtr OpenEventW(uint access, bool inherit, string name);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool SetEvent(IntPtr handle);
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
 
     public RadioControl(Dispatcher dispatcher, string? repo)
     {
         _repo = repo;
+        _installed = repo is not null && File.Exists(Path.Combine(repo, "installation.json"));
         _watch = new DispatcherTimer(TimeSpan.FromMilliseconds(400), DispatcherPriority.Background,
-                                     (_, _) => Look(), dispatcher) { IsEnabled = false };
+                                     (_, _) => Look(), dispatcher)
+        { IsEnabled = false };
     }
 
     public RadioPhase Phase { get; private set; }
     public string LastLine { get; private set; } = "";
-    public string LogFolder => _repo is null ? "" : RadioSupervisor.LogFolder(_repo);
+    public string LogFolder => _installed ? InstalledState : _repo is null ? "" : RadioSupervisor.LogFolder(_repo);
     public event Action? Changed;
 
     private void Become(RadioPhase phase, string lastLine = "")
@@ -45,7 +58,35 @@ public sealed class RadioControl : IRadio
 
     public void Start()
     {
+        if (_installed)
+        {
+            _installedStartAt = DateTime.UtcNow;
+            using var start = Process.Start(new ProcessStartInfo("schtasks.exe")
+            {
+                Arguments = $"/Run /TN {InstalledTask}",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            });
+            Become(RadioPhase.Starting);
+            _watch.Start();
+            return;
+        }
         if (_supervisor is not null) return;
+        try
+        {
+            if (MediaTekStatus.Present())
+            {
+                Become(RadioPhase.Failed, "AirDrop is not ready for this MediaTek Wi-Fi adapter.");
+                return;
+            }
+        }
+        catch (Exception error) when (error is Win32Exception or UnauthorizedAccessException or IOException)
+        {
+            Become(RadioPhase.Failed, error.Message);
+            return;
+        }
         if (_repo is null || !File.Exists(RadioSupervisor.RadioProgram(_repo))
                           || !File.Exists(RadioSupervisor.AwdlProgram(_repo)))
         {
@@ -58,7 +99,8 @@ public sealed class RadioControl : IRadio
         {
             _supervisor = Process.Start(new ProcessStartInfo(Environment.ProcessPath!)
             {
-                UseShellExecute = true, Verb = "runas",
+                UseShellExecute = true,
+                Verb = "runas",
                 Arguments = $"{RadioSupervisor.Flag} {Environment.ProcessId} {stopName}",
             });
         }
@@ -78,6 +120,13 @@ public sealed class RadioControl : IRadio
 
     public void Stop()
     {
+        if (_installed)
+        {
+            var handle = OpenEventW(2, false, @"Global\winawdl-mt7925-stop");
+            if (handle != IntPtr.Zero) { SetEvent(handle); CloseHandle(handle); }
+            Become(RadioPhase.Stopping);
+            return;
+        }
         if (_supervisor is null) return;
         _stop?.Set();
         Become(RadioPhase.Stopping);
@@ -91,6 +140,34 @@ public sealed class RadioControl : IRadio
 
     private void Look()
     {
+        if (_installed)
+        {
+            try
+            {
+                var active = OpenEventW(2, false, @"Global\winawdl-mt7925-stop");
+                if (active != IntPtr.Zero) CloseHandle(active);
+                using var doc = JsonDocument.Parse(File.ReadAllText(Path.Combine(InstalledState, "radio-status.json")));
+                var value = doc.RootElement;
+                var state = value.GetProperty("state").GetString();
+                if (state is "failed" or "recovery-failed")
+                {
+                    Become(RadioPhase.Failed, value.TryGetProperty("error", out var error) ? error.GetString() ?? "" : "Radio recovery needs attention.");
+                    if (active == IntPtr.Zero) _watch.Stop();
+                }
+                else if (active == IntPtr.Zero && DateTime.UtcNow - _installedStartAt > TimeSpan.FromSeconds(15))
+                {
+                    Become(RadioPhase.Off); _watch.Stop();
+                }
+                else if (state is "preflight" or "switching") Become(RadioPhase.Starting);
+                else if (state == "completed")
+                {
+                    if (Phase == RadioPhase.Stopping) { Become(RadioPhase.Off); _watch.Stop(); }
+                }
+                else if (state == "radio-session-running") Become(RadioPhase.Running);
+            }
+            catch (Exception error) when (error is IOException or JsonException) { }
+            return;
+        }
         if (_supervisor is null) return;
         bool ended;
         try

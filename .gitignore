@@ -13,3 +13,18 @@ deps/wintun/
 # The feasibility study this project grew out of stays local.
 reports/
 research_notes/
+# Local proprietary driver snapshots, toolchains and generated reverse-engineering evidence.
+research/
+compatibility-check.json
+mediatek/bin/
+mediatek/obj/
+
+# Private identities and local installation state are never source artifacts.
+*.pem
+*.key
+*.etl
+*.pcap
+*.pcapng
+installation.json
+runtime/
+.vs/

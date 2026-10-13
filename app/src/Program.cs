@@ -25,6 +25,7 @@ public static class Program
         [Dev.Stage.Flag, .. var rest] => Dev.Stage.Run(rest),
         [Dev.Drive.Flag, .. var rest] => Dev.Drive.Run(rest),
         [Dev.Checks.Flag, .. var rest] => Dev.Checks.Run(rest),
+        [MediaTekStatus.Flag, .. var rest] => MediaTekStatus.Write(rest),
         _ => RunApp(args),
     };
 
@@ -88,7 +89,8 @@ public static class Program
         waiting.Start();
 
         model.StartTheEngine();
-        window.Show();
+        if (repo is not null && File.Exists(Path.Combine(repo, "installation.json"))) radio.Start();
+        if (!args.Contains("--background")) window.Show();
         app.Run();
         engine.Stop();
         radio.Stop();

@@ -16,7 +16,7 @@ if ($Check) {
   foreach ($mode in 'check', 'drive') {
     $out = "$repo\build\app\$mode"
     # The app has no console, so its exit is waited for and its log read.
-    $run = Start-Process $app -ArgumentList "--$mode", "`"$out`"" -Wait -PassThru
+    $run = Start-Process $app -ArgumentList "--$mode", "`"$out`"" -WindowStyle Hidden -Wait -PassThru
     Get-Content "$out\$mode.log" | Select-String -CaseSensitive '^(FAIL|STOPPED|ALL .*PASSED|\d+ FAILED)'
     if ($run.ExitCode -ne 0) { throw "$mode failed: read $out\$mode.log" }
   }

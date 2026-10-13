@@ -249,7 +249,8 @@ public static class Checks
             stop.Set();
         });
         var said = File.ReadAllText(Path.Combine(logs, "awdld.log"));
-        Expect(asked.Code == 0 && asked.Ended.Contains("stopped") && said.Contains("Reply from"),
+        // Windows localizes "Reply from"; TTL is still present on a reply.
+        Expect(asked.Code == 0 && asked.Ended.Contains("stopped") && said.Contains("TTL="),
                $"asked to stop -> both daemons end, exit {asked.Code}, their output is in the logs");
         Expect(said.Contains("Control-C") && asked.Seconds < 2.5 + 4,
                $"they are interrupted the way Ctrl+C does, not killed: stopped {asked.Seconds - 2.5:0.0} s after the request");

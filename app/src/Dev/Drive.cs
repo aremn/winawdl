@@ -28,6 +28,7 @@ internal sealed class OtherDevice : IDisposable
 {
     private readonly Process _process;
     private readonly ConcurrentQueue<JsonElement> _said = new();
+    private readonly ConcurrentQueue<string> _errors = new();
     private readonly List<JsonElement> _seen = [];
 
     public OtherDevice(string python, string repo, string name, int port, int peerPort, string folder)
@@ -42,10 +43,14 @@ internal sealed class OtherDevice : IDisposable
                  [
                      "-u", Path.Combine(repo, "airdrop", "engine.py"), "--loopback", "--port", $"{port}",
                      "--peer", $"[::1]:{peerPort}", "--name", name, "--outdir", folder,
+                     "--keys", Path.Combine(folder, "keys"),
                  ])
             start.ArgumentList.Add(argument);
         _process = Process.Start(start)!;
-        _process.ErrorDataReceived += (_, _) => { };
+        _process.ErrorDataReceived += (_, line) =>
+        {
+            if (!string.IsNullOrWhiteSpace(line.Data)) _errors.Enqueue(line.Data);
+        };
         _process.BeginErrorReadLine();
         _ = Task.Run(async () =>
         {
@@ -62,6 +67,8 @@ internal sealed class OtherDevice : IDisposable
         _process.StandardInput.WriteLine(JsonSerializer.Serialize(command));
         _process.StandardInput.Flush();
     }
+
+    public string FailureDetails => string.Join(Environment.NewLine, _errors);
 
     /// <summary>The first event not returned before that has these fields, or
     /// null if none comes in time.</summary>
@@ -318,8 +325,8 @@ public static class Drive
         public int Go()
         {
             var repo = Repo.Find() ?? throw new InvalidOperationException("the repository was not found");
-            var python = (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator)
-                .Select(part => Path.Combine(part, "py.exe")).First(File.Exists);
+            var python = EngineProcess.FindPython(repo)
+                ?? throw new InvalidOperationException("Python is required for the loopback scenario.");
             var mine = Directory.CreateDirectory(Path.Combine(folder, "mine")).FullName;
             var theirs = Directory.CreateDirectory(Path.Combine(folder, "theirs")).FullName;
             foreach (var old in Directory.GetFiles(mine).Concat(Directory.GetFiles(theirs))) File.Delete(old);
@@ -334,7 +341,8 @@ public static class Drive
             _desk = new ScriptedDesk(_app.Dispatcher) { RunsLater = true };
             _settings = new AppSettings { Name = "Driven PC", Folder = mine };
             _engine = new EngineProcess(_app.Dispatcher, repo,
-                                        ["--loopback", "--port", $"{myPort}", "--peer", $"[::1]:{theirPort}"]);
+                ["--loopback", "--port", $"{myPort}", "--peer", $"[::1]:{theirPort}",
+                 "--keys", Path.Combine(mine, "keys")], logDirectory: Path.Combine(folder, "engine"));
             var radio = new ScriptedRadio();
             _model = new TableModel(_engine, radio, _desk, _settings);
             _window = new MainWindow(_model, _theme, _settings)
@@ -364,7 +372,10 @@ public static class Drive
         private void Steps(string[] files, string big, string mine, string theirs, ScriptedRadio radio)
         {
             Say("The window is real, placed off screen, never activated. Presses go through automation peers.");
-            Check(Until(() => _model.Peers.Count == 1), "start: the other device shows up as a plate");
+            var discovered = Until(() => _model.Peers.Count == 1);
+            Check(discovered, "start: the other device shows up as a plate");
+            if (!discovered)
+                throw new InvalidOperationException("The loopback peer was not discovered. " + _other.FailureDetails);
             Check(_model.Presence == "Visible as Driven PC", $"start: the header says \"{_model.Presence}\"");
             var peer = _model.Peers[0];
             Shot("idle");

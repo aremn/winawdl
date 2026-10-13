@@ -32,7 +32,8 @@ public static class Repo
 }
 
 /// <summary>Runs airdrop\engine.py and passes JSON lines both ways.</summary>
-public sealed partial class EngineProcess(Dispatcher dispatcher, string? repo, IReadOnlyList<string> extraArguments) : IEngine
+public sealed partial class EngineProcess(Dispatcher dispatcher, string? repo, IReadOnlyList<string> extraArguments,
+                                          string? logDirectory = null) : IEngine
 {
     [System.Text.RegularExpressions.GeneratedRegex(@"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+ (?<level>[A-Z]+) (?<said>.*)$")]
     private static partial System.Text.RegularExpressions.Regex LogLine();
@@ -58,6 +59,13 @@ public sealed partial class EngineProcess(Dispatcher dispatcher, string? repo, I
             .Select(folder => Path.Combine(folder.Trim('"'), program))
             .FirstOrDefault(File.Exists);
 
+    internal static string? FindPython(string? root)
+    {
+        var bundled = root is null ? null : Path.Combine(root, "runtime", "python", "python.exe");
+        return bundled is not null && File.Exists(bundled) ? bundled
+            : OnPath("python.exe") ?? OnPath("py.exe");
+    }
+
     public void Start(string name, string folder, bool ask)
     {
         Stop();
@@ -68,7 +76,7 @@ public sealed partial class EngineProcess(Dispatcher dispatcher, string? repo, I
             return;
         }
         // The same choice the project's scripts make: the launcher first.
-        var python = OnPath("py.exe") ?? OnPath("python.exe");
+        var python = FindPython(repo);
         if (python is null)
         {
             Stopped?.Invoke("no_python", "");
@@ -76,9 +84,15 @@ public sealed partial class EngineProcess(Dispatcher dispatcher, string? repo, I
         }
         var start = new ProcessStartInfo(python)
         {
-            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = repo,
-            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
-            StandardInputEncoding = Utf8, StandardOutputEncoding = Utf8, StandardErrorEncoding = Utf8,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = repo,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardInputEncoding = Utf8,
+            StandardOutputEncoding = Utf8,
+            StandardErrorEncoding = Utf8,
         };
         foreach (var argument in (string[])["-u", script, "--name", name, "--outdir", folder])
             start.ArgumentList.Add(argument);
@@ -125,11 +139,13 @@ public sealed partial class EngineProcess(Dispatcher dispatcher, string? repo, I
         _ = Task.Run(() => Read(process));
     }
 
-    private static StreamWriter OpenLog()
+    private StreamWriter OpenLog()
     {
-        var old = new FileInfo(LogPath);
+        var path = logDirectory is null ? LogPath
+            : Path.Combine(Directory.CreateDirectory(logDirectory).FullName, "engine.log");
+        var old = new FileInfo(path);
         var keep = old.Exists && old.Length < LogLimitBytes;
-        return new StreamWriter(new FileStream(LogPath, keep ? FileMode.Append : FileMode.Create,
+        return new StreamWriter(new FileStream(path, keep ? FileMode.Append : FileMode.Create,
                                                FileAccess.Write, FileShare.ReadWrite), Utf8)
         {
             AutoFlush = true,

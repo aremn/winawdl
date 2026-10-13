@@ -26,6 +26,10 @@
     <Using Remove="System.Windows.Forms" />
     <Using Remove="System.Drawing" />
     <Compile Include="src\**\*.cs" />
+    <Compile Include="..\mediatek\DriverProfile.cs" Link="MediaTek\DriverProfile.cs" />
+    <Compile Include="..\mediatek\NativeControl.cs" Link="MediaTek\NativeControl.cs" />
+    <Compile Include="..\mediatek\DeviceSnapshot.cs" Link="MediaTek\DeviceSnapshot.cs" />
+    <None Include="..\mediatek\profiles\*.json" Link="profiles\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Page Include="src\**\*.xaml" />
   </ItemGroup>
 </Project>

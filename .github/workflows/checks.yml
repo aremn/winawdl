@@ -5,7 +5,6 @@ name: checks
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -50,3 +49,21 @@ jobs:
           $run = Start-Process build\app\winawdl\winawdl.exe -ArgumentList '--check', "`"$out`"" -Wait -PassThru
           if (Test-Path "$out\check.log") { Get-Content "$out\check.log" }
           exit $run.ExitCode
+
+  mediatek:
+    name: MediaTek control and protocol, no hardware
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+      - name: OEM profile checks
+        shell: pwsh
+        run: .\scripts\build-mediatek.ps1 -Check
+      - name: Native build and protocol checks
+        shell: pwsh
+        run: .\driver\mediatek\build.ps1 -SkipDriver -Check
+      - name: Recovery checks, no device access
+        shell: powershell
+        run: .\scripts\tests\mediatek-recovery.ps1
