@@ -68,6 +68,8 @@ public:
   }
 
 private:
+  static constexpr uint64_t peerAwakeWindowUs = 16000;
+  static constexpr unsigned maxUnicastBurst = 12;
   const HANDLE stopEvent;
   const std::filesystem::path reportPath = statePath(L"session-result.json");
   const std::filesystem::path releasePath = statePath(L"memory-release.signal");
@@ -88,7 +90,7 @@ private:
        freed = true;
   unsigned ringAddress = 0, dmaIndex = 0, descriptorControl = 0, setupBase = 0,
            setupIndex = 0;
-  unsigned receivedEvents = 0, rxDmaIndex = 0;
+  unsigned receivedEvents = 0;
   MtkNicCapability capability;
   std::array<uint8_t, 6> radioAddress{}, awdlPeer{};
   bool radioEnabled = false, snifferEnabled = false, radioDisabled = false,
@@ -115,6 +117,9 @@ private:
            dataUnicastAckCount = 0, dataUnicastFailedCount = 0;
   unsigned peerDataWindows = 0;
   unsigned ringWraps = 0;
+  uint16_t dataReportedRate = 0;
+  uint64_t dataTxAttempts = 0, dataTxDelayTicks = 0;
+  uint32_t maxDataTxDelayTicks = 0;
 
   uint64_t peerLastRxUs = 0, maxUnicastDequeueDelayUs = 0;
   uint64_t lastUnicastPeerRxUs = 0;
@@ -193,13 +198,14 @@ private:
 
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(waitMilliseconds);
-    while (std::chrono::steady_clock::now() < deadline) {
+    unsigned processed = 0;
+    while (waitMilliseconds == 0 ? processed < 32
+                                : std::chrono::steady_clock::now() < deadline) {
       MemoryBarrier();
       const auto control = rxRing[tail].ctrl;
-      rxDmaIndex = operation(handle, 0x250c);
       if (!(control & 0x80000000u)) {
-        // During the live AWDL loop the one-millisecond poll
-        // leaves normal reception to its parser, not this drain.
+        if (!waitMilliseconds) return false;
+        // Nonblocking AWDL polls leave normal reception to its parser.
         if (waitMilliseconds > 1) drainControlData();
         Sleep(1);
         continue;
@@ -210,6 +216,7 @@ private:
       const auto *data = bufferPointer(3 + tail);
 
       ++receivedEvents;
+      ++processed;
       if (!mtkDot11Frame(data, bytes).empty()) {
         if (mcuFrames.size() == 32) mcuFrames.pop_front();
         mcuFrames.emplace_back(data, data + bytes);
@@ -225,6 +232,11 @@ private:
           if (pending.data) {
             ++dataTxFirmwareCompleted;
             if (pending.unicast) {
+              dataReportedRate = status.rate;
+              dataTxAttempts += status.attempts;
+              dataTxDelayTicks += status.delayTicks;
+              maxDataTxDelayTicks =
+                  (std::max)(maxDataTxDelayTicks, status.delayTicks);
               if (status.success) {
                 dataTxAck = true;
                 ++dataUnicastAckCount;
@@ -505,6 +517,10 @@ private:
                << ",\"transmitted\":" << awdlTxSubmitted
                << ",\"ringWraps\":" << ringWraps
                << ",\"dataAck\":" << dataUnicastAckCount
+               << ",\"dataFailed\":" << dataUnicastFailedCount
+               << ",\"dataReportedRate\":" << dataReportedRate
+               << ",\"dataTxAttempts\":" << dataTxAttempts
+               << ",\"dataTxDelayTicks\":" << dataTxDelayTicks
                << ",\"peerSwitches\":" << peerSwitches
                << ",\"otherPeerDropped\":" << hostOtherPeerDropped << "}";
         health.close();
@@ -517,7 +533,9 @@ private:
       if (WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) break;
       if (awdlLink->stopping())
         throw std::runtime_error("The AWDL pipe ended early");
-      waitEvent([](const uint8_t *, size_t) { return false; }, 1);
+      // Drain ready completions without spending the peer's short awake
+      // window waiting for a reply that this polling call never accepts.
+      waitEvent([](const uint8_t *, size_t) { return false; }, 0);
 
       if (!hostCandidate.empty() &&
           monotonicMicros() - hostCandidateAt > 2000000) {
@@ -531,7 +549,8 @@ private:
         std::copy(hostCandidate.begin() + 4, hostCandidate.begin() + 10,
                   target.begin());
         const auto heard = peerReceived(target);
-        if (target != awdlPeer && heard && monotonicMicros() - heard <= 4000 &&
+        if (target != awdlPeer && heard &&
+            monotonicMicros() - heard <= peerAwakeWindowUs &&
             std::none_of(
                 pendingActions.begin(), pendingActions.end(),
                 [](const PendingAction &item) { return item.active; })) {
@@ -560,11 +579,16 @@ private:
            slot < pendingActions.size() && awdlTxSubmitted < 100000000u;
            ++slot) {
         if (pendingActions[slot].active) continue;
+        // Refill for each free slot, so one loop can publish a bounded burst
+        // of data rather than one data frame followed by management traffic.
+        if (hostCandidate.empty() && awdlLink->popData(hostCandidate))
+          hostCandidateAt = monotonicMicros();
         const auto nowUs = monotonicMicros();
         const bool peerWindow =
             peerEnabled &&
-            (peerLastRxUs > lastUnicastPeerRxUs || unicastInWindow < 3) &&
-            nowUs - peerLastRxUs <= 4000;
+            (peerLastRxUs > lastUnicastPeerRxUs ||
+             unicastInWindow < maxUnicastBurst) &&
+            nowUs - peerLastRxUs <= peerAwakeWindowUs;
 
         std::vector<uint8_t> frame;
         bool hostData = false;
@@ -837,6 +861,10 @@ private:
            << ",\"firmwareCompleted\":" << awdlTxFirmwareCompleted
            << ",\"dataAck\":" << dataUnicastAckCount
            << ",\"dataFailed\":" << dataUnicastFailedCount
+           << ",\"dataReportedRate\":" << dataReportedRate
+           << ",\"dataTxAttempts\":" << dataTxAttempts
+           << ",\"dataTxDelayTicks\":" << dataTxDelayTicks
+           << ",\"maxDataTxDelayTicks\":" << maxDataTxDelayTicks
            << ",\"ringWraps\":" << ringWraps
            << ",\"peerSwitches\":" << peerSwitches
            << ",\"hostExpired\":" << hostExpired

@@ -482,6 +482,9 @@ struct MtkTxStatus {
   bool matched = false;
   bool success = false;
   uint32_t status = 0;
+  uint16_t rate = 0;
+  uint8_t attempts = 0;
+  uint32_t delayTicks = 0;
 };
 inline MtkTxStatus mtkTxStatus(const uint8_t *data, size_t length,
                                uint8_t packetId) {
@@ -505,7 +508,9 @@ inline MtkTxStatus mtkFwTxStatus(const uint8_t *data, size_t length,
     if (bytes < 4 || bytes > length - offset) return {};
     if (tag == 0 && bytes >= 32 && data[offset + 4] == packetId &&
         mtkLe16(data + offset + 6) == sequence)
-      return {true, data[offset + 5] == 0, data[offset + 5]};
+      return {true, data[offset + 5] == 0, data[offset + 5],
+              mtkLe16(data + offset + 10), data[offset + 9],
+              mtkLe32(data + offset + 20)};
     offset += bytes;
   }
   return {};

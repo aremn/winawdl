@@ -37,9 +37,13 @@ inline void mtkDecodeSelfTest() {
   if (host.size() != echo.size() || mtkLe32(host.data() + 8) != 0x20 ||
       (mtkLe32(host.data() + 12) & 1))
     throw std::runtime_error("Unicast host frame descriptor rejected");
+  if (mtkLe32(host.data() + 24) != 0x0201001c)
+    throw std::runtime_error("Unicast data did not use its rate table entry");
   hostFrame[4] = 0x33;
   if (!(mtkLe32(mtkAwDlHostRequest(hostFrame, 14, 128).data() + 12) & 1))
     throw std::runtime_error("Multicast host frame requires an ACK");
+  if (mtkLe32(mtkAwDlHostRequest(hostFrame, 14, 128).data() + 24) != 0x0201001c)
+    throw std::runtime_error("Multicast discovery rate table changed");
   hostFrame[45]++;
   bool rejected = false;
   try {
@@ -135,8 +139,14 @@ inline void mtkDecodeSelfTest() {
   txDone[50] = 32;
   txDone[52] = 129;
   txDone[54] = 2;
+  txDone[57] = 2;
+  txDone[58] = 0x4b;
+  mtkPut32(txDone.data() + 68, 50);
   if (!mtkFwTxStatus(txDone.data(), txDone.size(), 129, 2).success)
     throw std::runtime_error("Successful TX-done fixture rejected");
+  const auto measured = mtkFwTxStatus(txDone.data(), txDone.size(), 129, 2);
+  if (measured.rate != 0x4b || measured.attempts != 2 || measured.delayTicks != 50)
+    throw std::runtime_error("TX-done radio measurements were decoded incorrectly");
   txDone[53] = 3;
   if (mtkFwTxStatus(txDone.data(), txDone.size(), 129, 2).success)
     throw std::runtime_error("MPDU failure accepted as an ACK");
