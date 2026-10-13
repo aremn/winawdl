@@ -6,7 +6,6 @@ namespace Winawdl.MediaTek;
 public static class Program
 {
     private static readonly JsonSerializerOptions Json = new() { PropertyNameCaseInsensitive = true, WriteIndented = true };
-    private sealed record SavedSettings(string Sha256, string DriverVersion, Guid InterfaceId, bool AutoConfig, PhyRadio[] Radios);
 
     public static int Main(string[] args)
     {
@@ -27,10 +26,9 @@ public static class Program
 
             if (args[0] == "--restore-settings")
             {
-                var saved = JsonSerializer.Deserialize<SavedSettings>(File.ReadAllText(args[1]), Json)
+                var saved = JsonSerializer.Deserialize<SavedWlanSettings>(File.ReadAllText(args[1]), Json)
                     ?? throw new InvalidDataException("Saved WLAN settings are missing.");
-                if (saved.InterfaceId != device.InterfaceId || saved.Sha256 != profile.Sha256 || saved.DriverVersion != profile.DriverVersion)
-                    throw new InvalidOperationException("The saved settings belong to another adapter or driver.");
+                saved.CheckAdapter(device, profile);
                 wlan.Restore(saved.AutoConfig, saved.Radios);
                 return 0;
             }
@@ -59,6 +57,7 @@ public static class Program
             Write(args[1], new
             {
                 profile.Id,
+                device.InstanceId,
                 device.HardwareId,
                 device.InterfaceId,
                 device.DriverVersion,

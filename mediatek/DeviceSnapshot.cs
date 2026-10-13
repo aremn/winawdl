@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 
 namespace Winawdl.MediaTek;
 
-public sealed record DeviceSnapshot(string HardwareId, string DriverVersion, string DriverPath,
+public sealed record DeviceSnapshot(string InstanceId, string HardwareId, string DriverVersion, string DriverPath,
                                     Guid InterfaceId, int InterfaceState)
 {
     public static DeviceSnapshot Read()
@@ -26,7 +26,8 @@ public sealed record DeviceSnapshot(string HardwareId, string DriverVersion, str
                 if (config?.GetValue("NetCfgInstanceId") is not string interfaceText || !Guid.TryParse(interfaceText, out var id)) continue;
                 var state = WlanState(id);
                 if (state < 0) continue;
-                return new DeviceSnapshot(@"PCI\" + deviceName, config.GetValue("DriverVersion") as string ?? "",
+                return new DeviceSnapshot(@"PCI\" + deviceName + @"\" + instanceName,
+                    @"PCI\" + deviceName, config.GetValue("DriverVersion") as string ?? "",
                     Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32", "drivers", "mtkwecx.sys"), id, state);
             }
         }

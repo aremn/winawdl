@@ -6,6 +6,21 @@ namespace Winawdl.MediaTek;
 
 public sealed record PhyRadio(int Index, int Software, int Hardware);
 
+internal sealed record SavedWlanSettings(string Sha256, string DriverVersion, string InstanceId,
+                                        string HardwareId, bool AutoConfig, PhyRadio[] Radios)
+{
+    public void CheckAdapter(DeviceSnapshot device, DriverProfile profile)
+    {
+        // Windows can recreate NetCfgInstanceId when the OEM driver is rebound.
+        // The PCI instance identifies the physical device across that change.
+        if (!string.Equals(InstanceId, device.InstanceId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(HardwareId, device.HardwareId, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(Sha256, profile.Sha256, StringComparison.OrdinalIgnoreCase) ||
+            DriverVersion != profile.DriverVersion)
+            throw new InvalidOperationException("The saved settings belong to another adapter or driver.");
+    }
+}
+
 /// <summary>An OEM WLAN snapshot. Restore software radio and
 /// autoconfiguration through public WLAN APIs, including from a watchdog.</summary>
 public sealed class WlanSettings : IDisposable

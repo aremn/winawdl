@@ -34,6 +34,16 @@ internal static class ProfileChecks
                 throw new Exception("The supported subsystem was rejected.");
             if (found.AcceptsHardware("PCI\\VEN_14C3&DEV_7925&SUBSYS_00000000&REV_00"))
                 throw new Exception("An unknown subsystem was accepted.");
+            var device = new DeviceSnapshot("PCI\\synthetic\\instance", "PCI\\synthetic", approved.DriverVersion,
+                driver, Guid.NewGuid(), 4);
+            var saved = new SavedWlanSettings(approved.Sha256.ToUpperInvariant(), approved.DriverVersion,
+                device.InstanceId, device.HardwareId, true, [new PhyRadio(0, 2, 1)]);
+            saved.CheckAdapter(device with { InterfaceId = Guid.NewGuid() }, approved);
+            ExpectWrongAdapter(saved with { InstanceId = "PCI\\synthetic\\other" }, device, approved);
+            ExpectWrongAdapter(saved with { InstanceId = null! }, device, approved);
+            ExpectWrongAdapter(saved with { HardwareId = "PCI\\other" }, device, approved);
+            ExpectWrongAdapter(saved with { Sha256 = new string('0', 64) }, device, approved);
+            ExpectWrongAdapter(saved with { DriverVersion = "5.4.0.2975" }, device, approved);
             approved.CheckFirmware(firmware, approved.FirmwareVersion);
             try { approved.CheckFirmware(firmware, "20241206164308"); throw new Exception("Changed loaded firmware was accepted."); }
             catch (InvalidOperationException) { }
@@ -56,8 +66,15 @@ internal static class ProfileChecks
             File.Delete(manifest);
             Directory.Delete(fixture);
         }
-        Console.WriteLine("PASS: exact fingerprint, unknown version, changed binary, update during session, changed firmware bundle/build, exact hardware match.");
+        Console.WriteLine("PASS: exact fingerprint, unknown version, changed binary, update during session, changed firmware bundle/build, exact hardware match, WLAN restore across interface recreation with PCI identity checks.");
         return 0;
+    }
+
+    private static void ExpectWrongAdapter(SavedWlanSettings saved, DeviceSnapshot device, DriverProfile profile)
+    {
+        try { saved.CheckAdapter(device, profile); }
+        catch (InvalidOperationException) { return; }
+        throw new Exception("A WLAN snapshot from another adapter or driver was accepted.");
     }
 
 }

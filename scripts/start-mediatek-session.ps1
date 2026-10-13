@@ -92,6 +92,9 @@ try {
     throw 'OEM preflight failed.'
   }
   $settings = Get-Content -LiteralPath $snapshot -Raw | ConvertFrom-Json
+  if ($settings.instanceId -ne $card.InstanceId) {
+    throw 'The OEM snapshot belongs to another PCI device.'
+  }
   $profile = Get-Content -LiteralPath (Join-Path $repo ('mediatek\profiles\'+$settings.id+'.json')) -Raw | ConvertFrom-Json
   if (@($settings.radios | Where-Object {
         $_.Software -ne 2
